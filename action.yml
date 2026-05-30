@@ -1,0 +1,80 @@
+name: 'Webpack to Vite analyzer'
+description: 'Analyze a Webpack config and map it to a Vite config. AST-based, with actionable warnings.'
+author: 'ShiftKit'
+branding:
+  icon: 'shuffle'
+  color: 'blue'
+
+inputs:
+  file:
+    description: 'Path to the webpack.config.* file. Ignored when apply=true (auto-detected). Defaults to stdin.'
+    required: false
+    default: ''
+  apply:
+    description: 'When "true", write vite.config.ts to disk. When "false" (default), print to stdout.'
+    required: false
+    default: 'false'
+  strict:
+    description: 'Fail the action if any manual-tier warnings are emitted.'
+    required: false
+    default: 'false'
+  force:
+    description: 'With apply=true, bypass dirty-tree / overwrite / not-a-git-repo checks.'
+    required: false
+    default: 'false'
+  working-directory:
+    description: 'Working directory for the run.'
+    required: false
+    default: '.'
+  package-version:
+    description: 'npm dist-tag or version range for @shiftkit/webpack-to-vite (e.g. "latest").'
+    required: false
+    default: 'latest'
+
+outputs:
+  warning-count:
+    description: 'Total number of report items emitted.'
+    value: ${{ steps.run.outputs.warning-count }}
+  manual-count:
+    description: 'Number of manual-tier items emitted.'
+    value: ${{ steps.run.outputs.manual-count }}
+  json:
+    description: 'Full analyzer output as a JSON string.'
+    value: ${{ steps.run.outputs.json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run @shiftkit/webpack-to-vite
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_FILE: ${{ inputs.file }}
+        INPUT_APPLY: ${{ inputs.apply }}
+        INPUT_STRICT: ${{ inputs.strict }}
+        INPUT_FORCE: ${{ inputs.force }}
+        INPUT_PACKAGE_VERSION: ${{ inputs.package-version }}
+      run: |
+        set -euo pipefail
+        if [ "$INPUT_APPLY" != "true" ] && [ -z "$INPUT_FILE" ]; then
+          echo "Error: set 'file' (e.g. file: webpack.config.js) or apply: 'true'." >&2
+          exit 2
+        fi
+        ARGS=( "--json" )
+        if [ "$INPUT_STRICT" = "true" ]; then ARGS+=( "--strict" ); fi
+        if [ "$INPUT_APPLY" = "true" ]; then
+          ARGS+=( "--apply" )
+          if [ "$INPUT_FORCE" = "true" ]; then ARGS+=( "--force" ); fi
+        elif [ -n "$INPUT_FILE" ]; then
+          ARGS+=( "$INPUT_FILE" )
+        fi
+        OUTPUT=$(npx --yes "@shiftkit/webpack-to-vite@$INPUT_PACKAGE_VERSION" "${ARGS[@]}")
+        echo "$OUTPUT"
+        {
+          echo "json<<__W2V_EOF__"
+          echo "$OUTPUT"
+          echo "__W2V_EOF__"
+        } >> "$GITHUB_OUTPUT"
+        echo "warning-count=$(echo "$OUTPUT" | jq '.warnings | length')" >> "$GITHUB_OUTPUT"
+        echo "manual-count=$(echo "$OUTPUT" | jq '[.warnings[] | select(.type == "manual")] | length')" >> "$GITHUB_OUTPUT"

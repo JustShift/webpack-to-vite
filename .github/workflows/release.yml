@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Uses npm Trusted Publishing (OIDC). No NPM_TOKEN secret required.
+# Configure once on npmjs.com → @shiftkit/webpack-to-vite → Settings →
+# Trusted Publishing → Add → GitHub Actions → repo JustShift/webpack-to-vite,
+# workflow file release.yml, environment (none).
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the GitHub Release
+      id-token: write   # needed for npm OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 ships with npm 11+, which is required for OIDC trusted publishing.
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      # --provenance forces npm CLI to request the OIDC token from GitHub Actions.
+      - run: npm publish --provenance --access public
+
+      # Create the GitHub Release for this tag, using the matching CHANGELOG.md
+      # section as the body. Runs only after a successful publish.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES="$(mktemp)"
+          # Extract the "## <version> …" section from CHANGELOG.md (up to the next "## ").
+          awk -v ver="$VERSION" '
+            $0 ~ "^## "ver"([ ]|$)" {flag=1; next}
+            flag && /^## / {flag=0}
+            flag {print}
+          ' CHANGELOG.md > "$NOTES"
+          if [ -s "$NOTES" ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$NOTES" \
+              --verify-tag
+          else
+            echo "No CHANGELOG.md section found for $VERSION; using auto-generated notes." >&2
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
