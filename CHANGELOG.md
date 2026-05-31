@@ -10,7 +10,7 @@
 
 ## 0.1.0 — 2026-05-31
 
-- Vite 8-first Webpack → Vite migration analyzer with a parse → static-eval → intermediate-model → render pipeline. Static AST only — your webpack config is never executed.
+- Vite 8-first Webpack → Vite migration analyzer with a parse → static-eval → intermediate-model → render pipeline. Static AST only, so your webpack config is never executed.
   - **Vite 8 default output** (`build.rolldownOptions`, built-in `resolve.tsconfigPaths`); `targetViteMajor: 7` falls back to `build.rollupOptions` + the `vite-tsconfig-paths` plugin.
   - Stable `WarningCode`s on every warning; confidence band (`getConfidence`) and raw tier counts (`tierCounts`); dependency checklist (`buildDependencies`) on the result.
   - Handlers for `resolve` (array-form alias, `name$` → exact regex, `__dirname` ESM note, array-value guard), loaders (native/asset/preprocessor/svgr/worker/custom + CSS-Modules-naming detection), plugins (`DefinePlugin` extraction with `process.env` shim, Html/Copy/Provide/checker/compression/visualizer, `ModuleFederationPlugin` hard stop), `devServer` proxy (+ `pathRewrite` → `rewrite` fn), `entry`, `output`, `devtool`, `optimization.splitChunks`, `externals`, `target`.

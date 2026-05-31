@@ -2,9 +2,9 @@
 
 Analyze a Webpack config and map it to a **Vite 8**-oriented `vite.config.ts`. AST-based, deterministic, with tiered, actionable warnings.
 
-> **Status: early (0.1.x).** This is an **analyzer**, not a one-click converter. It parses `webpack.config.js` statically (Babel AST — your config is **never executed**), emits a `vite.config.ts` skeleton, a tiered migration report, and a dependency checklist. It deliberately does *not* claim to migrate source code or architecture — Webpack's loader/plugin surface is too large for that to be safe. It tells you exactly where the work is.
+> **Status: early (0.1.x).** This is an **analyzer**, not a one-click converter. It parses `webpack.config.js` statically (Babel AST, so your config is **never executed**), emits a `vite.config.ts` skeleton, a tiered migration report, and a dependency checklist. It does *not* claim to migrate source code or architecture. Webpack's loader/plugin surface is too large for that to be safe. It tells you exactly where the work is.
 
-Part of [ShiftKit](https://github.com/JustShift) — one focused, AST-based migration tool per migration.
+Part of [ShiftKit](https://github.com/JustShift): one focused, AST-based migration tool per migration.
 
 ## Install
 
@@ -60,10 +60,10 @@ getConfidence(result.warnings); // 'High confidence' | 'Verify before merging' |
 | Tier | Meaning |
 |---|---|
 | `info` | Bookkeeping / dropped because Vite handles it natively. |
-| `verify` | Mapped or suggested, but behavior may differ — check it. |
+| `verify` | Mapped or suggested, but behavior may differ. Check it. |
 | `manual` | Cannot be safely mapped from config alone. |
 
-Each warning carries a stable `code` (e.g. `resolve.aliasExact`, `plugin.federation`, `entry.multiPage`) so reports are snapshot-testable and machine-filterable. Confidence is reported as raw counts (e.g. `2 manual · 4 verify · 6 info`) — never a fake percentage.
+Each warning carries a stable `code` (e.g. `resolve.aliasExact`, `plugin.federation`, `entry.multiPage`) so reports are snapshot-testable and machine-filterable. Confidence is reported as raw counts (e.g. `2 manual · 4 verify · 6 info`), never a fake percentage.
 
 ## What it maps today
 
@@ -94,7 +94,7 @@ Vite 8 is the default output (`build.rolldownOptions`, built-in tsconfig paths);
 
 ## Trust
 
-Deterministic, runs locally, **never executes your config** — no `eval`, no `new Function`, no `require()` of the config, no calling exported config functions. Same input → same output.
+Deterministic, runs locally, and **never executes your config**: no `eval`, no `new Function`, no `require()` of the config, no calling exported config functions. Same input, same output.
 
 ## License
 
