@@ -1,8 +1,8 @@
 # @shiftkit/webpack-to-vite
 
-Analyze a Webpack config and map it to a Vite config. AST-based, with actionable warnings.
+Analyze a Webpack config and map it to a **Vite 8**-oriented `vite.config.ts`. AST-based, deterministic, with tiered, actionable warnings.
 
-> **Status: early (0.1.x).** This is an **analyzer** — it parses `webpack.config.js`, classifies what maps cleanly to Vite, what needs a Vite plugin, and what needs manual work, and emits a `vite.config.ts` skeleton. It does not attempt a fully automatic, drop-in conversion (Webpack's loader/plugin surface is too large for that to be safe). It tells you exactly where the work is.
+> **Status: early (0.1.x).** This is an **analyzer**, not a one-click converter. It parses `webpack.config.js` statically (Babel AST — your config is **never executed**), emits a `vite.config.ts` skeleton, a tiered migration report, and a dependency checklist. It deliberately does *not* claim to migrate source code or architecture — Webpack's loader/plugin surface is too large for that to be safe. It tells you exactly where the work is.
 
 Part of [ShiftKit](https://github.com/JustShift) — one focused, AST-based migration tool per migration.
 
@@ -10,43 +10,91 @@ Part of [ShiftKit](https://github.com/JustShift) — one focused, AST-based migr
 
 ```bash
 npm i -D @shiftkit/webpack-to-vite
-# or:
+# or run once:
 npx @shiftkit/webpack-to-vite webpack.config.js
 ```
 
 ## Usage
 
 ```bash
-# print the vite.config.ts skeleton + report
+# print the vite.config.ts skeleton; the report goes to stderr
 webpack-to-vite webpack.config.js
 
-# pipe via stdin
-cat webpack.config.js | webpack-to-vite
+# machine-readable result
+webpack-to-vite webpack.config.js --json
 
-# write vite.config.ts to disk (auto-detects webpack.config.*; refuses on a dirty tree)
-webpack-to-vite --apply
+# fail CI when anything needs manual work
+webpack-to-vite webpack.config.js --strict
+
+# write vite.config.ts + shiftkit-webpack-to-vite-report.json (never touches package.json)
+webpack-to-vite webpack.config.js --apply --out vite.config.ts
+
+# target Vite 7 (rollupOptions + vite-tsconfig-paths) instead of the Vite 8 default
+webpack-to-vite webpack.config.js --target-vite 7
+
+# (advanced) also scan source for migration traps (require.context, process.env, workers…)
+webpack-to-vite webpack.config.js --source "src/**/*.{js,jsx,ts,tsx}"
 ```
 
-Options: `--strict`, `--quiet`, `--json`, `--apply`, `--force`. See `--help`.
+See `--help` for all flags. `--apply` refuses to run on a dirty tree / outside a git repo unless `--force`, never deletes your webpack config, and never mutates `package.json`.
 
 ## Programmatic API
 
 ```ts
-import { analyzeWebpackConfig } from '@shiftkit/webpack-to-vite';
+import { analyzeWebpackConfig, getConfidence } from '@shiftkit/webpack-to-vite';
 
-const { output, warnings, flags } = analyzeWebpackConfig(webpackConfigSource);
+const result = analyzeWebpackConfig(webpackConfigSource, {
+  targetViteMajor: 8,        // default; 7 for the rollupOptions/plugin fallback
+  // sourceFiles: [{ path, content }],  // optional source scan
+});
+
+result.output;        // vite.config.ts skeleton (string)
+result.warnings;      // { type, code, message, path? }[]
+result.flags;         // detection flags (needsSvgr, hasModuleFederation, …)
+result.dependencies;  // { name, reason, required, caution? }[]
+getConfidence(result.warnings); // 'High confidence' | 'Verify before merging' | 'Manual review required'
 ```
 
-## What it classifies today
+### Warning tiers
 
-| Webpack | Vite |
+| Tier | Meaning |
 |---|---|
-| `resolve.alias` | `resolve.alias` (string targets) |
-| `resolve.extensions` | `resolve.extensions` |
-| `module.rules` loaders | `babel/ts/css/postcss/file/url/raw` → native; `sass-loader` → install `sass`; `*svg*` → `vite-plugin-svgr`; unknown → manual |
-| `plugins` | `HtmlWebpackPlugin`/`MiniCssExtractPlugin`/`CopyWebpackPlugin` → native/built-in; `DefinePlugin` → `define`; unknown → manual |
-| `devServer` | `server` (port, open, host, proxy) |
-| `mode`, `devtool`, `optimization`, `entry`, `output`, `externals`, `target` | mapped with a verify/manual note |
+| `info` | Bookkeeping / dropped because Vite handles it natively. |
+| `verify` | Mapped or suggested, but behavior may differ — check it. |
+| `manual` | Cannot be safely mapped from config alone. |
+
+Each warning carries a stable `code` (e.g. `resolve.aliasExact`, `plugin.federation`, `entry.multiPage`) so reports are snapshot-testable and machine-filterable. Confidence is reported as raw counts (e.g. `2 manual · 4 verify · 6 info`) — never a fake percentage.
+
+## What it maps today
+
+| Webpack | Vite | Tier |
+|---|---|---|
+| `resolve.alias` (string / `path.resolve`) | `resolve.alias` array form | auto / verify |
+| `resolve.alias` `name$` (exact) | `{ find: /^name$/, … }` | verify |
+| `resolve.extensions` | `resolve.extensions` | info |
+| `tsconfig-paths` coupling | `resolve.tsconfigPaths: true` (Vite 8) / `vite-tsconfig-paths` (Vite 7) | verify |
+| `babel/ts/css/style/postcss` loaders | dropped (native) | info |
+| `file/url/raw` loaders | dropped; `?url` / `?raw` import suffixes | verify |
+| `sass/less/stylus` loaders | install the compiler | verify |
+| `@svgr/webpack` | `vite-plugin-svgr` (`?react`) | verify |
+| `worker-loader` | `?worker` import suffix | manual |
+| `DefinePlugin` | `define` (+ `process.env` shim → `import.meta.env`; `NODE_ENV` dropped) | verify / manual |
+| React / Vue / Svelte / Solid signal | matching `@vitejs/plugin-*` wired into `plugins` | verify |
+| `HtmlWebpackPlugin` | root `index.html` | verify |
+| `Copy` / `MiniCssExtract` / `ProvidePlugin` / checkers / compression / analyzer | publicDir / native / plugins | info / verify / manual |
+| `ModuleFederationPlugin` | hard stop (architecture) | manual |
+| `devServer` (port/host/open/https/proxy + `pathRewrite`) | `server` | info / verify |
+| `entry` (string / object / array / fn) | `build.*Options.input` (HTML-first) | verify / manual |
+| `output` (path / publicPath / filename) | `outDir` / `base` / naming hints | info / verify |
+| `devtool` | `build.sourcemap` | info / verify |
+| `optimization.splitChunks` | Rolldown `codeSplitting` stub | verify |
+| `externals`, non-web `target` | manual | manual |
+
+Vite 8 is the default output (`build.rolldownOptions`, built-in tsconfig paths); pass `targetViteMajor: 7` for the `build.rollupOptions` + plugin fallback.
+
+## Trust
+
+Deterministic, runs locally, **never executes your config** — no `eval`, no `new Function`, no `require()` of the config, no calling exported config functions. Same input → same output.
 
 ## License
 

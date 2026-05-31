@@ -22,6 +22,18 @@ inputs:
     description: 'With apply=true, bypass dirty-tree / overwrite / not-a-git-repo checks.'
     required: false
     default: 'false'
+  target-vite:
+    description: 'Target Vite major version: "8" (default) or "7".'
+    required: false
+    default: '8'
+  out:
+    description: 'With apply=true, the vite config path to write (default vite.config.ts).'
+    required: false
+    default: 'vite.config.ts'
+  source:
+    description: 'Optional glob of source files to scan for migration traps (e.g. "src/**/*.{js,ts,tsx}").'
+    required: false
+    default: ''
   working-directory:
     description: 'Working directory for the run.'
     required: false
@@ -54,6 +66,9 @@ runs:
         INPUT_APPLY: ${{ inputs.apply }}
         INPUT_STRICT: ${{ inputs.strict }}
         INPUT_FORCE: ${{ inputs.force }}
+        INPUT_TARGET_VITE: ${{ inputs.target-vite }}
+        INPUT_OUT: ${{ inputs.out }}
+        INPUT_SOURCE: ${{ inputs.source }}
         INPUT_PACKAGE_VERSION: ${{ inputs.package-version }}
       run: |
         set -euo pipefail
@@ -61,11 +76,13 @@ runs:
           echo "Error: set 'file' (e.g. file: webpack.config.js) or apply: 'true'." >&2
           exit 2
         fi
-        ARGS=( "--json" )
+        ARGS=( "--json" "--target-vite" "$INPUT_TARGET_VITE" )
         if [ "$INPUT_STRICT" = "true" ]; then ARGS+=( "--strict" ); fi
+        if [ -n "$INPUT_SOURCE" ]; then ARGS+=( "--source" "$INPUT_SOURCE" ); fi
         if [ "$INPUT_APPLY" = "true" ]; then
-          ARGS+=( "--apply" )
+          ARGS+=( "--apply" "--out" "$INPUT_OUT" )
           if [ "$INPUT_FORCE" = "true" ]; then ARGS+=( "--force" ); fi
+          if [ -n "$INPUT_FILE" ]; then ARGS+=( "$INPUT_FILE" ); fi
         elif [ -n "$INPUT_FILE" ]; then
           ARGS+=( "$INPUT_FILE" )
         fi

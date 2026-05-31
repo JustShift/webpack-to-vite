@@ -1,0 +1,139 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`fixture suite (v0.1 release gate) > fx-alias > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:resolve.alias",
+  "info:resolve.extensions",
+  "verify:resolve.aliasExact",
+  "verify:resolve.dirnameEsm",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-alias-array-value > snapshots exact warning tiers + codes 1`] = `
+[
+  "verify:resolve.aliasArrayValue",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-commonjs-dep > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:source.require",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-css-modules > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:module.nativeLoader",
+  "info:module.nativeLoader",
+  "verify:module.cssModulesNaming",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-env-define > snapshots exact warning tiers + codes 1`] = `
+[
+  "manual:plugin.defineEnv",
+  "verify:plugin.define",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-framework-cra > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:config.mode",
+  "info:framework.cra",
+  "info:vite8.note",
+  "verify:entry.mapped",
+  "verify:framework.plugin",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-function-form > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:config.mode",
+  "info:vite8.note",
+  "manual:config.dynamic",
+  "verify:config.functionForm",
+  "verify:entry.mapped",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-html-plugin > snapshots exact warning tiers + codes 1`] = `
+[
+  "verify:plugin.html",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-minimal > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:config.mode",
+  "info:output.outDir",
+  "info:vite8.note",
+  "verify:entry.mapped",
+  "verify:output.naming",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-module-federation > snapshots exact warning tiers + codes 1`] = `
+[
+  "manual:plugin.federation",
+  "verify:framework.plugin",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-multipage > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:vite8.note",
+  "verify:entry.multiPage",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-node-globals > snapshots exact warning tiers + codes 1`] = `
+[
+  "manual:plugin.provide",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-plugins > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:plugin.miniCss",
+  "verify:plugin.copy",
+  "verify:plugin.html",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-proxy > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:devServer.basic",
+  "verify:devServer.proxy",
+  "verify:devServer.proxyRewrite",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-require-context > snapshots exact warning tiers + codes 1`] = `
+[
+  "manual:source.requireContext",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-splitchunks > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:optimization.splitChunks",
+  "info:vite8.note",
+  "verify:optimization.splitChunks",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-svg-assets > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:module.nativeLoader",
+  "info:module.nativeLoader",
+  "verify:framework.plugin",
+  "verify:module.assetLoader",
+  "verify:module.svgr",
+]
+`;
+
+exports[`fixture suite (v0.1 release gate) > fx-worker > snapshots exact warning tiers + codes 1`] = `
+[
+  "manual:module.workerLoader",
+]
+`;

@@ -1,107 +1,282 @@
-import * as parser from '@babel/parser';
-import _traverse, { type NodePath } from '@babel/traverse';
-import _generator from '@babel/generator';
-import * as t from '@babel/types';
-
-// Babel ships CJS that interops oddly with NodeNext + strict TS. The runtime
-// check picks the callable regardless of how the bundler resolves default.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const traverse: any =
-  typeof _traverse === 'function' ? _traverse : (_traverse as unknown as { default: unknown }).default;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const generate: any =
-  typeof _generator === 'function' ? _generator : (_generator as unknown as { default: unknown }).default;
-
-export interface Warning {
-  type: 'manual' | 'verify' | 'info';
-  message: string;
-}
-
-export interface ConvertOptions {
-  /** Reserved for future output-shape options. */
-  format?: boolean;
-}
-
-export interface ConversionFlags {
-  needsSvgr: boolean;
-  needsSass: boolean;
-  hasCustomLoaders: boolean;
-  hasComplexPlugins: boolean;
-}
-
-export interface ConversionResult {
-  output: string;
-  warnings: Warning[];
-  flags: ConversionFlags;
-}
-
-function emptyFlags(): ConversionFlags {
-  return { needsSvgr: false, needsSass: false, hasCustomLoaders: false, hasComplexPlugins: false };
-}
-
-// Loaders Vite handles natively (no plugin needed) vs ones that map to a plugin/dep.
-const NATIVE_LOADERS = new Set([
-  'babel-loader',
-  'ts-loader',
-  'esbuild-loader',
-  'style-loader',
-  'css-loader',
-  'postcss-loader',
-  'file-loader',
-  'url-loader',
-  'raw-loader',
-  'json-loader',
-]);
-
 /**
- * Analyze a Webpack config (`webpack.config.js`) and emit a `vite.config.ts`
- * skeleton plus a classification of what maps cleanly, what needs a Vite plugin,
- * and what needs manual work.
+ * @shiftkit/webpack-to-vite — Webpack → Vite migration analyzer.
  *
- * NOTE: This is the initial skeleton — it establishes the parse → classify → emit
- * pipeline and the warning tiers, and handles the common surface (resolve, the
- * loaders in module.rules, well-known plugins, devServer). Deeper coverage of
- * exotic loaders/plugins and function-form configs is the work to fill in.
+ * analyzeWebpackConfig() parses a webpack config statically (Babel AST, never
+ * executed) and returns a Vite-8-oriented vite.config.ts skeleton, a tiered
+ * migration report (manual / verify / info), the detection flags, and a
+ * dependency checklist.
+ *
+ *   auto   — statically safe config mapping
+ *   verify — mapped or suggested, but behavior may differ
+ *   manual — cannot be safely mapped from config alone
+ *   info   — bookkeeping / dropped because Vite handles it
  */
-export function analyzeWebpackConfig(input: string, _options: ConvertOptions = {}): ConversionResult {
+import * as t from '@babel/types';
+import { parseWebpackConfig } from './parser.js';
+import { propName } from './static-eval.js';
+import { render } from './render.js';
+import { buildDependencies } from './dependencies.js';
+import {
+  handleDevServer,
+  handleDevtool,
+  handleEntry,
+  handleExternals,
+  handleModule,
+  handleOptimization,
+  handleOutput,
+  handlePlugins,
+  handleResolve,
+  handleTarget,
+  scanSource,
+} from './handlers.js';
+import {
+  DEFAULT_TARGET_VITE_MAJOR,
+  emptyFlags,
+  emptyModel,
+  type AnalyzeOptions,
+  type AnalyzerContext,
+  type ConversionFlags,
+  type ConversionResult,
+  type ResolvedOptions,
+  type Warning,
+  type WarningCode,
+} from './types.js';
+
+function resolveOptions(options?: AnalyzeOptions): ResolvedOptions {
+  return {
+    strict: options?.strict ?? false,
+    targetViteMajor: options?.targetViteMajor ?? DEFAULT_TARGET_VITE_MAJOR,
+    sourceFiles: options?.sourceFiles ?? [],
+  };
+}
+
+function createContext(options: ResolvedOptions): { ctx: AnalyzerContext; warnings: Warning[] } {
   const warnings: Warning[] = [];
   const seen = new Set<string>();
-  const warn = (type: Warning['type'], message: string) => {
-    const key = `${type}::${message}`;
+  const warn = (type: Warning['type'], code: WarningCode, message: string, path?: string) => {
+    const key = `${type}:${code}:${message}:${path ?? ''}`;
     if (seen.has(key)) return;
     seen.add(key);
-    warnings.push({ type, message });
+    warnings.push(path ? { type, code, message, path } : { type, code, message });
+  };
+  const ctx: AnalyzerContext = {
+    model: emptyModel(),
+    flags: emptyFlags(options.targetViteMajor),
+    options,
+    extraDependencies: [],
+    manual: (code, message, path) => warn('manual', code, message, path),
+    verify: (code, message, path) => warn('verify', code, message, path),
+    info: (code, message, path) => warn('info', code, message, path),
+  };
+  return { ctx, warnings };
+}
+
+function failure(message: string, code: WarningCode, output: string, flags: ConversionFlags): ConversionResult {
+  return {
+    output,
+    warnings: [{ type: 'manual', code, message }],
+    flags,
+    dependencies: buildDependencies(flags),
+  };
+}
+
+export function analyzeWebpackConfig(input: string, options?: AnalyzeOptions): ConversionResult {
+  const resolved = resolveOptions(options);
+  const flags = emptyFlags(resolved.targetViteMajor);
+
+  const parsed = parseWebpackConfig(input);
+  if (parsed.parseError) {
+    return failure(
+      'Failed to parse the input as JavaScript/TypeScript. Ensure it is a valid webpack config.',
+      'config.parseError',
+      `// Failed to parse webpack config as JavaScript/TypeScript.\n// Error: ${parsed.parseError}\n\n${input}`,
+      flags
+    );
+  }
+  if (!parsed.configObject) {
+    return failure(
+      'Could not detect a webpack config object (module.exports = {…}, export default {…}, or a function returning one).',
+      'config.notFound',
+      `// Could not find a webpack config object.\n` +
+        `// Expected module.exports = {...}, export default {...}, a config identifier,\n` +
+        `// or a function returning a static config object.\n\n${input}`,
+      flags
+    );
+  }
+
+  const { ctx, warnings } = createContext(resolved);
+
+  // Input-shape notes.
+  if (parsed.usedFunctionForm) {
+    ctx.verify(
+      'config.functionForm',
+      `A function-form config (e.g. module.exports = (env, argv) => ({...})) was detected. The returned static object was read WITHOUT executing the function; any logic in the body was not evaluated.`
+    );
+  }
+  if (parsed.dependsOnEnvArgv) {
+    ctx.manual(
+      'config.dynamic',
+      `Config depends on env/argv. This analyzer parsed the static shape only — resolve the conditional config (per-mode values) manually.`
+    );
+  }
+  if (parsed.multiConfigArray) {
+    ctx.verify(
+      'config.functionForm',
+      `Multiple configs were exported as an array. Only the first config was analyzed; migrate the others separately (Vite multi-build needs separate configs or a build script).`
+    );
+  }
+
+  // Cheap framework detection from the raw config text.
+  if (/react-scripts/.test(input)) {
+    ctx.flags.hasFrameworkSpecificWebpack = true;
+    ctx.info(
+      'framework.cra',
+      `Create React App (react-scripts) signals detected. CRA hides its webpack config; consider the CRA → Vite path (index.html move, env vars REACT_APP_* → VITE_*, jest → vitest) rather than migrating an ejected config field-by-field.`
+    );
+  }
+
+  // webpack-merge means we likely only see one of several merged config layers.
+  if (/webpack-merge/.test(input)) {
+    ctx.verify(
+      'config.merge',
+      `webpack-merge detected. The analyzer reads one config object statically — if your real config is the merge of several files, resolve the merged result first (or run the analyzer per file) so nothing is missed.`
+    );
+  }
+
+  // Suggest (and wire in) the matching Vite framework plugin — a React/Vue/etc.
+  // Vite config without its framework plugin won't render components.
+  detectFrameworkPlugin(ctx, input);
+
+  // TypeScript path coupling → enable Vite's tsconfig paths resolution.
+  if (/tsconfig-?paths/i.test(input)) {
+    ctx.flags.needsTsconfigPaths = true;
+    ctx.model.resolve.tsconfigPaths = true;
+    ctx.verify(
+      'resolve.tsconfigPaths',
+      resolved.targetViteMajor === 8
+        ? `tsconfig path coupling detected. Enabled Vite 8's built-in resolve.tsconfigPaths: true (note: it has a small resolution-performance cost).`
+        : `tsconfig path coupling detected. Added the vite-tsconfig-paths plugin (Vite 7 has no built-in tsconfig paths resolution).`
+    );
+  }
+
+  dispatch(ctx, parsed.configObject);
+
+  // Optional, opt-in source scan (CLI / advanced browser input).
+  if (resolved.sourceFiles.length > 0) {
+    scanSource(ctx, resolved.sourceFiles);
+  }
+
+  // Vite 8 bookkeeping note: emitted when Vite-8-sensitive build output appears.
+  const b = ctx.model.build;
+  if (
+    resolved.targetViteMajor === 8 &&
+    (b.input != null || b.entryFileNames != null || b.chunkFileNames != null || b.codeSplittingNote === true || ctx.flags.hasExternals)
+  ) {
+    ctx.model.vite8NoteNeeded = true;
+    ctx.info(
+      'vite8.note',
+      `Output targets Vite 8: build.rollupOptions → build.rolldownOptions, build.commonjsOptions is a no-op, and object-form manualChunks was removed (use Rolldown codeSplitting).`
+    );
+  }
+
+  const output = render(ctx.model, resolved.targetViteMajor);
+  return {
+    output,
+    warnings,
+    flags: ctx.flags,
+    dependencies: mergeDependencies(buildDependencies(ctx.flags), ctx.extraDependencies),
+  };
+}
+
+function mergeDependencies(
+  base: ConversionResult['dependencies'],
+  extra: ConversionResult['dependencies']
+): ConversionResult['dependencies'] {
+  const seen = new Set(base.map((d) => d.name));
+  return [...base, ...extra.filter((d) => !seen.has(d.name))];
+}
+
+// Detect the source framework and wire in the matching Vite plugin + dependency.
+// Conservative: only fires on strong signals (loader/preset/runtime package names),
+// and React is checked last so explicit vue/svelte/solid configs win.
+function detectFrameworkPlugin(ctx: AnalyzerContext, input: string): void {
+  const add = (
+    pluginImport: string,
+    pluginCall: string,
+    depName: string,
+    label: string
+  ): void => {
+    ctx.model.imports.add(pluginImport);
+    if (!ctx.model.plugins.includes(pluginCall)) ctx.model.plugins.unshift(pluginCall);
+    ctx.extraDependencies.push({
+      name: depName,
+      reason: `Vite needs the ${label} plugin to compile ${label} components (webpack used a loader/preset for this).`,
+      required: true,
+    });
+    ctx.verify(
+      'framework.plugin',
+      `${label} signals detected — added the ${depName} plugin to the Vite config. Verify it is the right framework plugin and version for your app.`
+    );
   };
 
-  const ast = parseInput(input);
-  if (!ast) {
-    return {
-      output: `// Failed to parse webpack config as JavaScript/TypeScript.\n\n${input}`,
-      warnings: [{ type: 'manual', message: 'Could not parse the input as a JavaScript/TypeScript webpack config.' }],
-      flags: emptyFlags(),
-    };
+  if (/vue-loader|@vitejs\/plugin-vue|['"]vue['"]/.test(input)) {
+    add(`import vue from '@vitejs/plugin-vue';`, 'vue()', '@vitejs/plugin-vue', 'Vue');
+    return;
   }
-
-  const config = findConfigObject(ast);
-  if (!config) {
-    return {
-      output:
-        `// Could not find a webpack config object.\n` +
-        `// Expected module.exports = {...}, export default {...}, or a function returning a config object.\n\n${input}`,
-      warnings: [{ type: 'manual', message: 'Could not detect a webpack config object (module.exports / export default / function form).' }],
-      flags: emptyFlags(),
-    };
+  if (/svelte-loader|svelte-preprocess|['"]svelte['"]/.test(input)) {
+    add(
+      `import { svelte } from '@sveltejs/vite-plugin-svelte';`,
+      'svelte()',
+      '@sveltejs/vite-plugin-svelte',
+      'Svelte'
+    );
+    return;
   }
+  if (/solid-js|babel-preset-solid|vite-plugin-solid/.test(input)) {
+    add(`import solid from 'vite-plugin-solid';`, 'solid()', 'vite-plugin-solid', 'Solid');
+    return;
+  }
+  if (/react-dom|preset-react|@svgr\/webpack|react-scripts|@vitejs\/plugin-react/.test(input)) {
+    add(`import react from '@vitejs/plugin-react';`, 'react()', '@vitejs/plugin-react', 'React');
+  }
+}
 
-  const flags = emptyFlags();
-  const resolveAlias: Array<[string, string]> = [];
-  const resolveExtensions: string[] = [];
-  const serverLines: string[] = [];
-  const definePresent = { value: false };
+// Top-level webpack fields whose closest Vite behavior is "drop it / handled
+// automatically". Emitting info keeps the report honest without noise.
+const BENIGN_TOP_LEVEL = new Set([
+  'context',
+  'stats',
+  'performance',
+  'cache',
+  'watch',
+  'watchOptions',
+  'infrastructureLogging',
+  'experiments',
+  'node',
+  'snapshot',
+  'recordsPath',
+  'profile',
+  'parallelism',
+  'name',
+  'dependencies',
+  'resolveLoader',
+  'ignoreWarnings',
+  'amd',
+  'bail',
+  'loader',
+]);
 
+function dispatch(ctx: AnalyzerContext, config: t.ObjectExpression): void {
   for (const prop of config.properties) {
+    if (t.isSpreadElement(prop)) {
+      ctx.manual(
+        'config.dynamic',
+        `A spread (...) in the top-level config could not be resolved statically. Inline its values; the analyzer cannot expand it.`
+      );
+      continue;
+    }
     if (!t.isObjectProperty(prop) || prop.computed) {
-      warn('verify', 'A dynamic/spread property in the webpack config could not be statically analyzed. Review it manually.');
+      ctx.manual('config.dynamic', `A dynamic/computed top-level config property could not be analyzed. Review it manually.`);
       continue;
     }
     const key = propName(prop);
@@ -110,268 +285,44 @@ export function analyzeWebpackConfig(input: string, _options: ConvertOptions = {
 
     switch (key) {
       case 'mode':
-        warn('info', `'mode' is implicit in Vite (dev server vs 'vite build'). Dropped.`);
+        ctx.info('config.mode', `'mode' is implicit in Vite (dev server vs 'vite build'). Dropped.`);
         break;
       case 'entry':
-        warn('verify', `'entry' maps to an HTML entry in Vite (index.html with a <script type="module">), or build.rollupOptions.input for multi-entry/library builds. Set it up manually.`);
+        handleEntry(ctx, value);
         break;
       case 'output':
-        warn('verify', `'output' maps to Vite 'build' (outDir, assetsDir, build.rollupOptions.output). Translate path/filename/publicPath manually.`);
+        if (t.isObjectExpression(value)) handleOutput(ctx, value);
         break;
       case 'resolve':
-        if (t.isObjectExpression(value)) handleResolve(value, resolveAlias, resolveExtensions);
+        if (t.isObjectExpression(value)) handleResolve(ctx, value);
         break;
       case 'module':
-        if (t.isObjectExpression(value)) handleModule(value);
+        if (t.isObjectExpression(value)) handleModule(ctx, value);
         break;
       case 'plugins':
-        if (t.isArrayExpression(value)) handlePlugins(value);
+        if (t.isArrayExpression(value)) handlePlugins(ctx, value);
         break;
       case 'devServer':
-        if (t.isObjectExpression(value)) handleDevServer(value, serverLines);
+        if (t.isObjectExpression(value)) handleDevServer(ctx, value);
         break;
       case 'devtool':
-        warn('info', `'devtool' maps to Vite 'build.sourcemap' (boolean/'inline'/'hidden'). Set it there if you need source maps in production.`);
+        handleDevtool(ctx, value);
         break;
       case 'optimization':
-        warn('verify', `'optimization' (splitChunks, minimize, runtimeChunk) is largely automatic in Vite/Rollup. Port only the parts you explicitly rely on to build.rollupOptions.`);
+        handleOptimization(ctx, value);
         break;
       case 'externals':
-        warn('manual', `'externals' maps to build.rollupOptions.external (and optionally 'output.globals'). Translate manually.`);
+        handleExternals(ctx, value);
         break;
       case 'target':
-        warn('verify', `'target' maps to Vite 'build.target' and/or 'ssr' options depending on intent. Verify.`);
+        handleTarget(ctx, value);
         break;
       default:
-        warn('manual', `Unmapped webpack field '${key}' was not converted. Review and migrate it manually.`);
-    }
-  }
-
-  const output = render({ resolveAlias, resolveExtensions, serverLines, definePresent, flags });
-  return { output, warnings, flags };
-
-  // ---- handlers (closures over warn/flags) ----
-
-  function handleResolve(obj: t.ObjectExpression, alias: Array<[string, string]>, exts: string[]) {
-    for (const p of obj.properties) {
-      if (!t.isObjectProperty(p) || p.computed) continue;
-      const k = propName(p);
-      if (k === 'alias' && t.isObjectExpression(p.value)) {
-        for (const a of p.value.properties) {
-          if (!t.isObjectProperty(a) || a.computed) continue;
-          const ak = propName(a);
-          if (ak && t.isStringLiteral(a.value)) alias.push([ak, a.value.value]);
-          else if (ak) warn('verify', `resolve.alias '${ak}' has a non-string target; copy it into resolve.alias manually.`);
-        }
-      } else if (k === 'extensions' && t.isArrayExpression(p.value)) {
-        for (const el of p.value.elements) if (t.isStringLiteral(el)) exts.push(el.value);
-      } else if (k === 'modules') {
-        warn('info', `resolve.modules is usually unnecessary in Vite. Drop it unless you have a non-standard layout.`);
-      }
-    }
-  }
-
-  function handleModule(obj: t.ObjectExpression) {
-    const rules = obj.properties.find((p) => t.isObjectProperty(p) && propName(p) === 'rules');
-    if (!rules || !t.isObjectProperty(rules) || !t.isArrayExpression(rules.value)) return;
-    for (const rule of rules.value.elements) {
-      if (!t.isObjectExpression(rule)) continue;
-      for (const loaderName of extractLoaderNames(rule)) {
-        if (/svg/.test(loaderName)) {
-          flags.needsSvgr = true;
-          warn('info', `SVG loader '${loaderName}' → use 'vite-plugin-svgr' (import SVGs as components via '?react'). Run: npm i -D vite-plugin-svgr`);
-        } else if (/sass-loader|scss/.test(loaderName)) {
-          flags.needsSass = true;
-          warn('info', `'${loaderName}' → Vite handles Sass natively once you install the compiler. Run: npm i -D sass`);
-        } else if (NATIVE_LOADERS.has(loaderName)) {
-          warn('info', `'${loaderName}' is handled natively by Vite (esbuild/PostCSS). No loader needed.`);
+        if (BENIGN_TOP_LEVEL.has(key)) {
+          ctx.info('config.unmapped', `'${key}' has no Vite config equivalent and is typically unnecessary. Dropped.`);
         } else {
-          flags.hasCustomLoaders = true;
-          warn('manual', `Loader '${loaderName}' has no direct Vite equivalent. Find the matching Vite plugin or rework the asset/transform handling.`);
+          ctx.manual('config.unmapped', `Unmapped webpack field '${key}' was not converted. Review and migrate it manually.`);
         }
-      }
     }
   }
-
-  function handlePlugins(arr: t.ArrayExpression) {
-    for (const el of arr.elements) {
-      const name = pluginName(el);
-      if (!name) {
-        flags.hasComplexPlugins = true;
-        warn('verify', `A plugin entry could not be statically identified. Review it against the Vite plugin ecosystem manually.`);
-        continue;
-      }
-      switch (name) {
-        case 'HtmlWebpackPlugin':
-          warn('info', `HtmlWebpackPlugin → Vite uses a root index.html as the entry; move your template there. No plugin needed.`);
-          break;
-        case 'DefinePlugin':
-          definePresent.value = true;
-          warn('verify', `DefinePlugin → Vite 'define'. Copy the replacement keys into the define block in the output.`);
-          break;
-        case 'MiniCssExtractPlugin':
-          warn('info', `MiniCssExtractPlugin → CSS extraction is automatic in 'vite build'. Drop it.`);
-          break;
-        case 'CopyWebpackPlugin':
-          warn('info', `CopyWebpackPlugin → put static files in 'public/', or use 'vite-plugin-static-copy' for custom targets.`);
-          break;
-        case 'ProvidePlugin':
-          warn('manual', `ProvidePlugin (auto-imported globals) has no direct Vite equivalent. Use explicit imports, or 'vite-plugin-inject'.`);
-          break;
-        default:
-          flags.hasComplexPlugins = true;
-          warn('manual', `Plugin '${name}' was not classified. Check whether an equivalent Vite plugin exists or whether Vite handles it natively.`);
-      }
-    }
-  }
-
-  function handleDevServer(obj: t.ObjectExpression, out: string[]) {
-    for (const p of obj.properties) {
-      if (!t.isObjectProperty(p) || p.computed) continue;
-      const k = propName(p);
-      if (k === 'port') out.push(`port: ${generate(p.value).code}`);
-      else if (k === 'open') out.push(`open: ${generate(p.value).code}`);
-      else if (k === 'proxy') out.push(`proxy: ${generate(p.value).code} /* verify shape: Vite proxy mirrors http-proxy */`);
-      else if (k === 'host') out.push(`host: ${generate(p.value).code}`);
-      else warn('verify', `devServer.${k} may not map directly to Vite 'server'. Check the Vite server options.`);
-    }
-  }
-}
-
-// ---- parsing helpers ----
-
-function parseInput(input: string): parser.ParseResult<t.File> | null {
-  try {
-    return parser.parse(input, { sourceType: 'unambiguous', plugins: ['typescript'] });
-  } catch {
-    return null;
-  }
-}
-
-function findConfigObject(ast: parser.ParseResult<t.File>): t.ObjectExpression | null {
-  let found: t.ObjectExpression | null = null;
-  const unwrap = (node: t.Node | null | undefined): t.ObjectExpression | null => {
-    if (!node) return null;
-    if (t.isObjectExpression(node)) return node;
-    // function-form: () => ({...}) or function() { return {...} }
-    if (t.isArrowFunctionExpression(node) || t.isFunctionExpression(node)) {
-      if (t.isObjectExpression(node.body)) return node.body;
-      if (t.isBlockStatement(node.body)) {
-        const ret = node.body.body.find((s): s is t.ReturnStatement => t.isReturnStatement(s));
-        if (ret && t.isObjectExpression(ret.argument)) return ret.argument;
-      }
-    }
-    return null;
-  };
-  traverse(ast, {
-    AssignmentExpression(path: NodePath<t.AssignmentExpression>) {
-      if (found) return;
-      const { left, right } = path.node;
-      if (
-        t.isMemberExpression(left) &&
-        t.isIdentifier(left.object, { name: 'module' }) &&
-        t.isIdentifier(left.property, { name: 'exports' })
-      ) {
-        found = unwrap(right);
-      }
-    },
-    ExportDefaultDeclaration(path: NodePath<t.ExportDefaultDeclaration>) {
-      if (found) return;
-      found = unwrap(path.node.declaration as t.Node);
-    },
-  });
-  return found;
-}
-
-function propName(p: t.ObjectProperty): string | null {
-  if (t.isIdentifier(p.key)) return p.key.name;
-  if (t.isStringLiteral(p.key)) return p.key.value;
-  return null;
-}
-
-function extractLoaderNames(rule: t.ObjectExpression): string[] {
-  const names: string[] = [];
-  for (const p of rule.properties) {
-    if (!t.isObjectProperty(p) || p.computed) continue;
-    const k = propName(p);
-    if (k === 'loader' && t.isStringLiteral(p.value)) names.push(p.value.value);
-    if (k === 'use') collectUse(p.value as t.Node, names);
-  }
-  return names;
-}
-
-function collectUse(node: t.Node, names: string[]) {
-  if (t.isStringLiteral(node)) names.push(node.value);
-  else if (t.isArrayExpression(node)) {
-    for (const el of node.elements) {
-      if (t.isStringLiteral(el)) names.push(el.value);
-      else if (t.isObjectExpression(el)) {
-        const loader = el.properties.find((p) => t.isObjectProperty(p) && propName(p) === 'loader');
-        if (loader && t.isObjectProperty(loader) && t.isStringLiteral(loader.value)) names.push(loader.value.value);
-      }
-    }
-  } else if (t.isObjectExpression(node)) {
-    const loader = node.properties.find((p) => t.isObjectProperty(p) && propName(p) === 'loader');
-    if (loader && t.isObjectProperty(loader) && t.isStringLiteral(loader.value)) names.push(loader.value.value);
-  }
-}
-
-function pluginName(node: t.Node | null): string | null {
-  if (!node) return null;
-  // `new SomePlugin(...)`
-  if (t.isNewExpression(node) && t.isIdentifier(node.callee)) return node.callee.name;
-  if (t.isNewExpression(node) && t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property)) {
-    return node.callee.property.name;
-  }
-  return null;
-}
-
-// ---- output rendering ----
-
-function render(parts: {
-  resolveAlias: Array<[string, string]>;
-  resolveExtensions: string[];
-  serverLines: string[];
-  definePresent: { value: boolean };
-  flags: ConversionFlags;
-}): string {
-  const { resolveAlias, resolveExtensions, serverLines, definePresent, flags } = parts;
-  const lines: string[] = [];
-  lines.push(`import { defineConfig } from 'vite';`);
-  if (flags.needsSvgr) lines.push(`import svgr from 'vite-plugin-svgr';`);
-  lines.push(``);
-  lines.push(`export default defineConfig({`);
-
-  if (flags.needsSvgr) lines.push(`  plugins: [svgr()],`);
-  if (definePresent.value) lines.push(`  define: { /* copy DefinePlugin replacement keys here */ },`);
-
-  if (resolveAlias.length > 0 || resolveExtensions.length > 0) {
-    lines.push(`  resolve: {`);
-    if (resolveAlias.length > 0) {
-      lines.push(`    alias: {`);
-      for (const [k, v] of resolveAlias) lines.push(`      ${quoteKey(k)}: ${JSON.stringify(v)},`);
-      lines.push(`    },`);
-    }
-    if (resolveExtensions.length > 0) {
-      lines.push(`    extensions: [${resolveExtensions.map((e) => JSON.stringify(e)).join(', ')}],`);
-    }
-    lines.push(`  },`);
-  }
-
-  if (serverLines.length > 0) {
-    lines.push(`  server: { ${serverLines.join(', ')} },`);
-  }
-
-  lines.push(`});`);
-  lines.push(``);
-  lines.push(`// Next steps:`);
-  lines.push(`// 1. npm i -D vite`);
-  if (flags.needsSvgr) lines.push(`// 2. npm i -D vite-plugin-svgr`);
-  if (flags.needsSass) lines.push(`// 3. npm i -D sass`);
-  lines.push(`// 4. Create an index.html entry at the project root (Vite's entry point).`);
-  return lines.join('\n');
-}
-
-function quoteKey(key: string): string {
-  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
 }
