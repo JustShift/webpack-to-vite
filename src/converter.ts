@@ -121,7 +121,7 @@ export function analyzeWebpackConfig(input: string, options?: AnalyzeOptions): C
   }
   if (parsed.multiConfigArray) {
     ctx.verify(
-      'config.functionForm',
+      'config.multiConfig',
       `Multiple configs were exported as an array. Only the first config was analyzed; migrate the others separately (Vite multi-build needs separate configs or a build script).`
     );
   }
@@ -266,6 +266,72 @@ const BENIGN_TOP_LEVEL = new Set([
   'loader',
 ]);
 
+// A section value the analyzer cannot read must still surface in the report —
+// silence here would print "High confidence" over dropped config.
+function dynamicSection(ctx: AnalyzerContext, key: string): void {
+  ctx.manual(
+    'config.dynamic',
+    `'${key}' is not a static literal and could not be analyzed. Inline its value and re-run, or migrate the section manually.`
+  );
+}
+
+function unwrapObject(node: t.Node): t.ObjectExpression | null {
+  if (t.isObjectExpression(node)) return node;
+  if (t.isTSAsExpression(node) || t.isTSSatisfiesExpression(node)) return unwrapObject(node.expression);
+  return null;
+}
+
+// Resolve conditional-inclusion idioms around the plugins array literal:
+// [...].filter(Boolean) and [...].concat(isProd ? [new X()] : []). The elements
+// are statically present in the source; losing them silently drops plugins.
+function unwrapPluginsArray(ctx: AnalyzerContext, node: t.Node): t.ArrayExpression | null {
+  if (t.isArrayExpression(node)) return node;
+  if (t.isTSAsExpression(node) || t.isTSSatisfiesExpression(node)) return unwrapPluginsArray(ctx, node.expression);
+  if (
+    t.isCallExpression(node) &&
+    t.isMemberExpression(node.callee) &&
+    !node.callee.computed &&
+    t.isIdentifier(node.callee.property)
+  ) {
+    const method = node.callee.property.name;
+    if (method === 'filter') return unwrapPluginsArray(ctx, node.callee.object);
+    if (method === 'concat') {
+      const base = unwrapPluginsArray(ctx, node.callee.object);
+      if (!base) return null;
+      const elements = [...base.elements];
+      for (const arg of node.arguments) {
+        if (!collectConcatArg(arg, elements)) {
+          ctx.manual(
+            'config.dynamic',
+            `A non-literal .concat() argument on 'plugins' could not be expanded. Review those plugins manually.`
+          );
+        }
+      }
+      return t.arrayExpression(elements);
+    }
+  }
+  return null;
+}
+
+function collectConcatArg(arg: t.Node, out: t.ArrayExpression['elements']): boolean {
+  if (t.isArrayExpression(arg)) {
+    out.push(...arg.elements);
+    return true;
+  }
+  // concat(isProd ? [a] : []) — both branches are statically known plugins.
+  if (t.isConditionalExpression(arg)) {
+    const a = collectConcatArg(arg.consequent, out);
+    const b = collectConcatArg(arg.alternate, out);
+    return a && b;
+  }
+  // concat(new X()) — single-element form.
+  if (t.isNewExpression(arg) || t.isCallExpression(arg)) {
+    out.push(arg);
+    return true;
+  }
+  return false;
+}
+
 function dispatch(ctx: AnalyzerContext, config: t.ObjectExpression): void {
   for (const prop of config.properties) {
     if (t.isSpreadElement(prop)) {
@@ -290,27 +356,45 @@ function dispatch(ctx: AnalyzerContext, config: t.ObjectExpression): void {
       case 'entry':
         handleEntry(ctx, value);
         break;
-      case 'output':
-        if (t.isObjectExpression(value)) handleOutput(ctx, value);
+      case 'output': {
+        const obj = unwrapObject(value);
+        if (obj) handleOutput(ctx, obj);
+        else dynamicSection(ctx, 'output');
         break;
-      case 'resolve':
-        if (t.isObjectExpression(value)) handleResolve(ctx, value);
+      }
+      case 'resolve': {
+        const obj = unwrapObject(value);
+        if (obj) handleResolve(ctx, obj);
+        else dynamicSection(ctx, 'resolve');
         break;
-      case 'module':
-        if (t.isObjectExpression(value)) handleModule(ctx, value);
+      }
+      case 'module': {
+        const obj = unwrapObject(value);
+        if (obj) handleModule(ctx, obj);
+        else dynamicSection(ctx, 'module');
         break;
-      case 'plugins':
-        if (t.isArrayExpression(value)) handlePlugins(ctx, value);
+      }
+      case 'plugins': {
+        const arr = unwrapPluginsArray(ctx, value);
+        if (arr) handlePlugins(ctx, arr);
+        else dynamicSection(ctx, 'plugins');
         break;
-      case 'devServer':
-        if (t.isObjectExpression(value)) handleDevServer(ctx, value);
+      }
+      case 'devServer': {
+        const obj = unwrapObject(value);
+        if (obj) handleDevServer(ctx, obj);
+        else dynamicSection(ctx, 'devServer');
         break;
+      }
       case 'devtool':
         handleDevtool(ctx, value);
         break;
-      case 'optimization':
-        handleOptimization(ctx, value);
+      case 'optimization': {
+        const obj = unwrapObject(value);
+        if (obj) handleOptimization(ctx, obj);
+        else dynamicSection(ctx, 'optimization');
         break;
+      }
       case 'externals':
         handleExternals(ctx, value);
         break;

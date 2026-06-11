@@ -281,6 +281,24 @@ export const FIXTURES: Fixture[] = [
     expectFlags: { hasHtmlPlugin: true },
   },
 
+  {
+    name: 'fx-plugins-conditional',
+    input: `
+      const HtmlWebpackPlugin = require('html-webpack-plugin');
+      const CompressionPlugin = require('compression-webpack-plugin');
+      const isProd = process.env.NODE_ENV === 'production';
+      module.exports = {
+        plugins: [
+          new HtmlWebpackPlugin({ template: './public/index.html' }),
+          isProd && new CompressionPlugin(),
+        ].filter(Boolean).concat(isProd ? [new MiniCssExtractPlugin()] : []),
+      };
+    `,
+    expectCodes: ['plugin.html', 'plugin.compression', 'plugin.miniCss'],
+    forbidCodes: ['config.dynamic'],
+    expectFlags: { hasHtmlPlugin: true, needsCompression: true },
+  },
+
   // ---- stretch fixtures ----
   {
     name: 'fx-node-globals',

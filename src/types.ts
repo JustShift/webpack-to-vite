@@ -28,12 +28,14 @@ export type WarningCode =
   | 'output.outDir'
   | 'output.naming'
   | 'output.publicPath'
+  | 'output.library'
   // resolve
   | 'resolve.alias'
   | 'resolve.aliasExact'
   | 'resolve.aliasArrayValue'
   | 'resolve.dirnameEsm'
   | 'resolve.tsconfigPaths'
+  | 'resolve.fallback'
   // module / loaders
   | 'module.nativeLoader'
   | 'module.preprocessor'
@@ -58,6 +60,7 @@ export type WarningCode =
   | 'devServer.basic'
   | 'devServer.proxy'
   | 'devServer.proxyRewrite'
+  | 'devServer.https'
   // devtool
   | 'devtool.sourcemap'
   // optimization
@@ -82,6 +85,7 @@ export type WarningCode =
   | 'config.notFound'
   | 'config.dynamic'
   | 'config.functionForm'
+  | 'config.multiConfig'
   | 'config.merge'
   | 'config.mode'
   | 'config.unmapped'

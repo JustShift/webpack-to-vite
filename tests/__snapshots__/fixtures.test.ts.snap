@@ -100,6 +100,14 @@ exports[`fixture suite (v0.1 release gate) > fx-plugins > snapshots exact warnin
 ]
 `;
 
+exports[`fixture suite (v0.1 release gate) > fx-plugins-conditional > snapshots exact warning tiers + codes 1`] = `
+[
+  "info:plugin.miniCss",
+  "verify:plugin.compression",
+  "verify:plugin.html",
+]
+`;
+
 exports[`fixture suite (v0.1 release gate) > fx-proxy > snapshots exact warning tiers + codes 1`] = `
 [
   "info:devServer.basic",

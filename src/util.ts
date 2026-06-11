@@ -13,9 +13,10 @@ export function quoteString(value: string): string {
   return JSON.stringify(value);
 }
 
-/** Escape a string for safe insertion into a RegExp source. */
+/** Escape a string for safe insertion into a RegExp source. Also escapes `/`
+ *  so the result can be rendered inside a regex literal. */
 export function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 }
 
 /** Last path segment of a `/`-separated path (used to derive a Vite outDir). */

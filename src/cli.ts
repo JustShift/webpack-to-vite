@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, resolve } from 'node:path';
 import { execSync } from 'node:child_process';
 import { analyzeWebpackConfig } from './converter.js';
 import { getConfidence, tierCounts } from './confidence.js';
@@ -231,7 +231,7 @@ const main = async () => {
   const cwd = process.cwd();
 
   if (parsed.apply) {
-    const src = parsed.file ? join(cwd, parsed.file) : findWebpackConfig(cwd);
+    const src = parsed.file ? resolve(cwd, parsed.file) : findWebpackConfig(cwd);
     if (!src || !existsSync(src)) {
       process.stderr.write(`--apply: no webpack config found${parsed.file ? ` at ${parsed.file}` : ` in ${cwd}`}.\n`);
       process.exit(1);
@@ -245,7 +245,7 @@ const main = async () => {
       process.stderr.write(`--apply: ${cwd} is not a git repository. Re-run with --force to apply without a rollback path.\n`);
       process.exit(1);
     }
-    const target = join(cwd, parsed.out);
+    const target = resolve(cwd, parsed.out);
     if (existsSync(target) && !parsed.force) {
       process.stderr.write(`Refusing to overwrite existing ${parsed.out}. Re-run with --force.\n`);
       process.exit(1);
@@ -278,7 +278,7 @@ const main = async () => {
     return;
   }
 
-  const input = parsed.file ? readFileSync(join(cwd, parsed.file), 'utf8') : await readStdin();
+  const input = parsed.file ? readFileSync(resolve(cwd, parsed.file), 'utf8') : await readStdin();
   if (!input.trim()) {
     process.stderr.write('No input provided. Pass a file path or pipe via stdin (or use --apply).\n');
     process.exit(2);

@@ -81,8 +81,13 @@ export function handleResolve(ctx: AnalyzerContext, obj: t.ObjectExpression): vo
         'resolve.modules',
         `resolve.modules is usually unnecessary in Vite. Drop it unless you have a non-standard module directory layout (then prefer resolve.alias).`
       );
+    } else if (key === 'fallback') {
+      ctx.flags.needsNodePolyfills = true;
+      ctx.manual(
+        'resolve.fallback',
+        `resolve.fallback provides Node core-module polyfills for browser code. Vite has no equivalent; evaluate vite-plugin-node-polyfills (use sparingly), or remove the dependency on Node built-ins.`
+      );
     }
-    // resolve.fallback (node polyfills) is detected via ProvidePlugin / source scan.
   }
 
   if (mappedAliases > 0) {
@@ -194,7 +199,42 @@ function walkRule(ctx: AnalyzerContext, rule: t.Node): void {
     }
   }
 
+  // webpack 5 asset modules: { test: /\.png$/, type: 'asset/resource' }.
+  const typeProp = rule.properties.find(
+    (p) => t.isObjectProperty(p) && !p.computed && propName(p) === 'type'
+  );
+  if (typeProp && t.isObjectProperty(typeProp) && t.isStringLiteral(typeProp.value)) {
+    classifyAssetModule(ctx, typeProp.value.value);
+  }
+
   for (const use of extractLoaderUses(rule)) classifyLoader(ctx, use);
+}
+
+const ASSET_MODULE_HINTS: Record<string, { tier: 'info' | 'verify'; hint: string }> = {
+  'asset/resource': {
+    tier: 'info',
+    hint: 'Vite emits imported assets as URLs by default; no config is needed.',
+  },
+  asset: {
+    tier: 'info',
+    hint: `Vite inlines assets below build.assetsInlineLimit (4kb default) and emits URLs otherwise, matching the 'asset' behavior. If parser.dataUrlCondition.maxSize was customized, set build.assetsInlineLimit.`,
+  },
+  'asset/inline': {
+    tier: 'verify',
+    hint: `Vite only auto-inlines small assets; force inlining per import with the '?inline' suffix. Verify imports that relied on always-inline behavior.`,
+  },
+  'asset/source': {
+    tier: 'verify',
+    hint: `Import file contents with the '?raw' suffix (e.g. import txt from './a.txt?raw'). Update those imports in source.`,
+  },
+};
+
+function classifyAssetModule(ctx: AnalyzerContext, type: string): void {
+  const entry = ASSET_MODULE_HINTS[type];
+  if (!entry) return; // 'javascript/auto' etc.: not an asset module
+  const message = `Asset module '${type}' is handled natively by Vite. ${entry.hint}`;
+  if (entry.tier === 'info') ctx.info('module.assetLoader', message);
+  else ctx.verify('module.assetLoader', message);
 }
 
 function extractLoaderUses(rule: t.ObjectExpression): LoaderUse[] {
@@ -243,8 +283,24 @@ function normalizeLoaderName(name: string): string {
   return n;
 }
 
+// Loaders whose job is taken over by the framework plugin that
+// detectFrameworkPlugin wires in (the loader name is its detection signal).
+const FRAMEWORK_LOADERS: Record<string, string> = {
+  'vue-loader': '@vitejs/plugin-vue',
+  'svelte-loader': '@sveltejs/vite-plugin-svelte',
+};
+
 function classifyLoader(ctx: AnalyzerContext, use: LoaderUse): void {
   const name = normalizeLoaderName(use.name);
+
+  const frameworkPlugin = FRAMEWORK_LOADERS[name];
+  if (frameworkPlugin) {
+    ctx.info(
+      'module.nativeLoader',
+      `${name} is replaced by the ${frameworkPlugin} plugin wired into this config. Drop the loader rule.`
+    );
+    return;
+  }
 
   if (name === '@svgr/webpack') {
     ctx.flags.needsSvgr = true;
@@ -347,18 +403,34 @@ const BENIGN_PLUGINS = new Set([
 export function handlePlugins(ctx: AnalyzerContext, arr: t.ArrayExpression): void {
   for (const el of arr.elements) {
     if (!el) continue;
-    const name = pluginName(el);
-    if (!name) {
-      ctx.flags.hasComplexPlugins = true;
-      ctx.verify(
-        'plugin.unknown',
-        `A plugin entry could not be identified statically. Review it against the Vite plugin ecosystem manually.`
-      );
-      continue;
+    for (const node of pluginNodes(el)) {
+      const name = pluginName(node);
+      if (!name) {
+        ctx.flags.hasComplexPlugins = true;
+        ctx.verify(
+          'plugin.unknown',
+          `A plugin entry could not be identified statically. Review it against the Vite plugin ecosystem manually.`
+        );
+        continue;
+      }
+      const args = t.isNewExpression(node) ? (node.arguments as t.Node[]) : [];
+      classifyPlugin(ctx, name, args);
     }
-    const args = t.isNewExpression(el) ? (el.arguments as t.Node[]) : [];
-    classifyPlugin(ctx, name, args);
   }
+}
+
+// Conditional-inclusion idioms inside the array: `isProd && new X()` and
+// `isProd ? new X() : null`. Classify the plugin expressions; the disabled
+// branches (null/false/undefined) contribute nothing.
+function pluginNodes(node: t.Node): t.Node[] {
+  if (t.isLogicalExpression(node)) return pluginNodes(node.right);
+  if (t.isConditionalExpression(node)) {
+    return [...pluginNodes(node.consequent), ...pluginNodes(node.alternate)];
+  }
+  if (t.isNullLiteral(node) || t.isBooleanLiteral(node) || t.isIdentifier(node, { name: 'undefined' })) {
+    return [];
+  }
+  return [node];
 }
 
 function pluginName(node: t.Node): string | null {
@@ -430,6 +502,12 @@ function classifyPlugin(ctx: AnalyzerContext, name: string, args: t.Node[]): voi
       ctx.info(
         'plugin.visualizer',
         `BundleAnalyzerPlugin → use rollup-plugin-visualizer (works with Vite/Rolldown) to inspect bundle composition.`
+      );
+      return;
+    case 'VueLoaderPlugin':
+      ctx.info(
+        'plugin.benign',
+        `VueLoaderPlugin is unnecessary in Vite; @vitejs/plugin-vue compiles .vue files. Drop it.`
       );
       return;
     case 'ModuleFederationPlugin':
@@ -560,11 +638,50 @@ export function handleDevServer(ctx: AnalyzerContext, obj: t.ObjectExpression): 
         mappedBasic = true;
         break;
       }
-      case 'https':
-      case 'server': // webpack 5 renamed https -> server: { type: 'https' }
-        ctx.model.server.https = key === 'https' ? getSource(value) : 'true';
-        mappedBasic = true;
+      case 'https': {
+        if (evalBoolean(value) === false) {
+          ctx.info('devServer.basic', `devServer.https: false is the default. Dropped.`);
+        } else if (t.isObjectExpression(value)) {
+          ctx.model.server.https = getSource(value);
+          mappedBasic = true;
+          ctx.verify(
+            'devServer.https',
+            `devServer.https options were copied to server.https. Vite passes them to https.createServer(); verify the key/cert paths.`
+          );
+        } else {
+          httpsNeedsCert(ctx);
+        }
         break;
+      }
+      case 'server': {
+        // webpack 5: server: 'http' | 'https' | 'spdy' | { type, options }
+        const type = evalString(value);
+        if (type === 'http') {
+          ctx.info('devServer.basic', `devServer.server: 'http' is the default. Dropped.`);
+        } else if (t.isObjectExpression(value)) {
+          const optionsProp = value.properties.find(
+            (sp) => t.isObjectProperty(sp) && !sp.computed && propName(sp) === 'options'
+          );
+          if (optionsProp && t.isObjectProperty(optionsProp) && t.isObjectExpression(optionsProp.value)) {
+            ctx.model.server.https = getSource(optionsProp.value);
+            mappedBasic = true;
+            ctx.verify(
+              'devServer.https',
+              `devServer.server.options were copied to server.https. Vite passes them to https.createServer(); verify the key/cert paths.`
+            );
+          } else {
+            httpsNeedsCert(ctx);
+          }
+        } else if (type === 'https' || type === 'spdy') {
+          httpsNeedsCert(ctx);
+        } else {
+          ctx.verify(
+            'devServer.https',
+            `devServer.server could not be read statically. If it enables HTTPS, configure server.https (cert options) or add @vitejs/plugin-basic-ssl.`
+          );
+        }
+        break;
+      }
       case 'proxy':
         handleProxy(ctx, value);
         break;
@@ -594,6 +711,23 @@ export function handleDevServer(ctx: AnalyzerContext, obj: t.ObjectExpression): 
   }
   if (mappedBasic) {
     ctx.info('devServer.basic', `Basic devServer options (port/host/open/https) were mapped to Vite 'server'.`);
+  }
+}
+
+// Vite's server.https takes https.createServer() options, not a boolean: a
+// cert is required. Suggest basic-ssl instead of emitting an invalid value.
+function httpsNeedsCert(ctx: AnalyzerContext): void {
+  ctx.verify(
+    'devServer.https',
+    `devServer enabled HTTPS without cert options. Vite's server.https takes https.createServer() options (a cert is required); add @vitejs/plugin-basic-ssl for an auto-generated self-signed cert, or set server.https.key/cert.`
+  );
+  if (!ctx.extraDependencies.some((d) => d.name === '@vitejs/plugin-basic-ssl')) {
+    ctx.extraDependencies.push({
+      name: '@vitejs/plugin-basic-ssl',
+      reason: 'Self-signed HTTPS for the dev server (webpack devServer had HTTPS enabled without cert options).',
+      required: false,
+      caution: 'Prefer real local certs (e.g. mkcert) in server.https for a trusted-cert setup.',
+    });
   }
 }
 
@@ -733,11 +867,14 @@ export function handleEntry(ctx: AnalyzerContext, value: t.Node): void {
   }
 
   if (t.isArrayExpression(value)) {
-    const first = value.elements.find((e): e is t.Expression => e != null && t.isStringLiteral(e));
-    if (first && t.isStringLiteral(first)) ctx.model.build.input = quoteString(first.value);
+    // Webpack bundles all array elements but exports the LAST one; earlier
+    // entries are usually polyfills.
+    const strings = value.elements.filter((e): e is t.StringLiteral => e != null && t.isStringLiteral(e));
+    const last = strings[strings.length - 1];
+    if (last) ctx.model.build.input = quoteString(last.value);
     ctx.verify(
       'entry.dynamic',
-      `entry is an array (multiple files bundled into one). Vite expects a single module entry; merge them, or import the extra files from your main entry. The first entry was used as a placeholder.`
+      `entry is an array (multiple files bundled into one; webpack exports the last). The last entry was used as a placeholder; import the earlier files (often polyfills) from it.`
     );
     return;
   }
@@ -751,8 +888,10 @@ export function handleEntry(ctx: AnalyzerContext, value: t.Node): void {
 function entryTarget(node: t.Node): string | null {
   if (t.isStringLiteral(node)) return quoteString(node.value);
   if (t.isArrayExpression(node)) {
-    const first = node.elements.find((e): e is t.StringLiteral => e != null && t.isStringLiteral(e));
-    if (first) return quoteString(first.value);
+    // Same array semantics as the top-level entry: webpack exports the last.
+    const strings = node.elements.filter((e): e is t.StringLiteral => e != null && t.isStringLiteral(e));
+    const last = strings[strings.length - 1];
+    if (last) return quoteString(last.value);
   }
   if (t.isObjectExpression(node)) {
     // { import: './x', dependOn: '...' }
@@ -779,12 +918,24 @@ export function handleOutput(ctx: AnalyzerContext, obj: t.ObjectExpression): voi
       case 'path': {
         const resolved = evalString(value);
         if (resolved) {
-          const dir = basename(resolved) || 'dist';
+          // path.resolve(__dirname, 'build/static') statically evals to the
+          // root-relative 'build/static'; keep the whole path. Absolute paths
+          // cannot be made root-relative, so fall back to the last segment.
+          const rel = resolved.replace(/^\.\//, '');
+          const isAbsolute = /^([A-Za-z]:[\\/]|\/)/.test(rel);
+          const dir = (isAbsolute ? basename(rel) : rel) || 'dist';
           ctx.model.build.outDir = quoteString(dir);
-          ctx.info(
-            'output.outDir',
-            `output.path was mapped to build.outDir ('${dir}'). Vite's outDir is relative to the project root; verify the location.`
-          );
+          if (isAbsolute) {
+            ctx.verify(
+              'output.outDir',
+              `output.path was an absolute path ('${resolved}'); only the last segment ('${dir}') was kept as build.outDir. Vite's outDir is relative to the project root; verify the location.`
+            );
+          } else {
+            ctx.info(
+              'output.outDir',
+              `output.path was mapped to build.outDir ('${dir}'). Vite's outDir is relative to the project root; verify the location.`
+            );
+          }
         } else {
           ctx.verify(
             'output.outDir',
@@ -831,7 +982,14 @@ export function handleOutput(ctx: AnalyzerContext, obj: t.ObjectExpression): voi
       case 'clean':
         ctx.info('output.outDir', `output.clean is the default in Vite ('vite build' empties outDir). Drop it.`);
         break;
-      // library / globalObject / assetModuleFilename etc. are out of v0.1 scope.
+      case 'library':
+      case 'libraryTarget':
+        ctx.manual(
+          'output.library',
+          `output.${key} was detected: this is a library build. Vite handles libraries via build.lib ({ entry, name, formats, fileName }); map library.type/libraryTarget to formats ('umd', 'es', 'cjs', 'iife'). The analyzer does not emit build.lib automatically yet.`
+        );
+        break;
+      // globalObject / assetModuleFilename etc. are out of v0.1 scope.
       default:
         break;
     }
@@ -876,8 +1034,7 @@ export function handleDevtool(ctx: AnalyzerContext, value: t.Node): void {
 // optimization
 // ---------------------------------------------------------------------------
 
-export function handleOptimization(ctx: AnalyzerContext, value: t.Node): void {
-  if (!t.isObjectExpression(value)) return;
+export function handleOptimization(ctx: AnalyzerContext, value: t.ObjectExpression): void {
   for (const p of value.properties) {
     if (!t.isObjectProperty(p) || p.computed) continue;
     const key = propName(p);

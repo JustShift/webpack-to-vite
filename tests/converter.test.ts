@@ -283,17 +283,209 @@ describe('plugin coverage', () => {
   });
 });
 
+describe('dynamic / wrapped sections', () => {
+  it('sees through plugins: [...].filter(Boolean)', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = {
+        plugins: [
+          new HtmlWebpackPlugin({ template: './public/index.html' }),
+          process.env.ANALYZE && new BundleAnalyzerPlugin(),
+        ].filter(Boolean),
+      };
+    `);
+    expect(hasCode(r, 'plugin.html')).toBe(true);
+    expect(hasCode(r, 'plugin.visualizer')).toBe(true);
+    expect(hasCode(r, 'config.dynamic')).toBe(false);
+  });
+
+  it('sees through plugins: [...].concat(cond ? [...] : [])', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = {
+        plugins: [new MiniCssExtractPlugin()].concat(isProd ? [new CompressionPlugin()] : []),
+      };
+    `);
+    expect(hasCode(r, 'plugin.miniCss')).toBe(true);
+    expect(hasCode(r, 'plugin.compression')).toBe(true);
+    expect(hasCode(r, 'config.dynamic')).toBe(false);
+  });
+
+  it('classifies both branches of a ternary plugin element', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = {
+        plugins: [isProd ? new CompressionPlugin() : new ForkTsCheckerWebpackPlugin()],
+      };
+    `);
+    expect(hasCode(r, 'plugin.compression')).toBe(true);
+    expect(hasCode(r, 'plugin.checker')).toBe(true);
+  });
+
+  it('warns on a non-literal .concat() argument but keeps the literal part', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = { plugins: [new HtmlWebpackPlugin()].concat(extraPlugins) };
+    `);
+    expect(hasCode(r, 'plugin.html')).toBe(true);
+    const dynamic = r.warnings.find((w) => w.code === 'config.dynamic');
+    expect(dynamic?.type).toBe('manual');
+  });
+
+  it('warns instead of silently dropping a dynamic plugins value', () => {
+    const r = analyzeWebpackConfig('module.exports = { plugins: getPlugins() };');
+    const dynamic = r.warnings.find((w) => w.code === 'config.dynamic');
+    expect(dynamic?.type).toBe('manual');
+    expect(dynamic?.message).toContain("'plugins'");
+  });
+
+  it('warns instead of silently dropping dynamic object sections', () => {
+    for (const key of ['output', 'resolve', 'module', 'devServer', 'optimization']) {
+      const r = analyzeWebpackConfig(`module.exports = { ${key}: makeSection() };`);
+      const dynamic = r.warnings.find((w) => w.code === 'config.dynamic');
+      expect(dynamic?.type, `section '${key}'`).toBe('manual');
+      expect(dynamic?.message).toContain(`'${key}'`);
+    }
+  });
+});
+
 describe('entry / output edge cases', () => {
-  it('treats an array entry as a placeholder with a verify note', () => {
+  it('uses the LAST array entry (webpack exports the last element)', () => {
     const r = analyzeWebpackConfig("module.exports = { entry: ['./polyfills.js', './src/index.js'] };");
     expect(hasCode(r, 'entry.dynamic')).toBe(true);
     expect(r.warnings.find((w) => w.code === 'entry.dynamic')?.type).toBe('verify');
+    expect(r.output).toContain("input: './src/index.js'");
+    expect(r.output).not.toContain('polyfills');
   });
 
   it('treats output.publicPath auto as verify without setting base', () => {
     const r = analyzeWebpackConfig("module.exports = { output: { publicPath: 'auto' } };");
     expect(hasCode(r, 'output.publicPath')).toBe(true);
     expect(r.output).not.toContain('base:');
+  });
+
+  it('keeps nested output.path directories intact', () => {
+    const r = analyzeWebpackConfig(`
+      const path = require('path');
+      module.exports = { output: { path: path.resolve(__dirname, 'build/static') } };
+    `);
+    expect(r.output).toContain("outDir: 'build/static'");
+  });
+
+  it('falls back to the last segment for absolute output.path with a verify note', () => {
+    const r = analyzeWebpackConfig("module.exports = { output: { path: '/var/www/dist' } };");
+    expect(r.output).toContain("outDir: 'dist'");
+    expect(r.warnings.find((w) => w.code === 'output.outDir')?.type).toBe('verify');
+  });
+
+  it('flags output.library as a manual build.lib migration', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { output: { library: { name: 'MyLib', type: 'umd' } } };"
+    );
+    const w = r.warnings.find((x) => x.code === 'output.library');
+    expect(w?.type).toBe('manual');
+    expect(w?.message).toContain('build.lib');
+  });
+
+  it('escapes slashes in exact-match alias regexes', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { resolve: { alias: { '@app/core$': './src/core' } } };"
+    );
+    expect(r.output).toContain('find: /^@app\\/core$/');
+  });
+});
+
+describe('devServer https', () => {
+  it('does not emit boolean https (invalid in Vite); suggests basic-ssl', () => {
+    const r = analyzeWebpackConfig('module.exports = { devServer: { https: true } };');
+    expect(r.output).not.toContain('https: true');
+    expect(r.warnings.find((w) => w.code === 'devServer.https')?.type).toBe('verify');
+    expect(r.dependencies.some((d) => d.name === '@vitejs/plugin-basic-ssl')).toBe(true);
+  });
+
+  it('copies https cert options through', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { devServer: { https: { key: './k.pem', cert: './c.pem' } } };"
+    );
+    expect(r.output).toContain('https: {');
+    expect(r.output).toContain("key: './k.pem'");
+  });
+
+  it("drops server: 'http' instead of turning it into HTTPS", () => {
+    const r = analyzeWebpackConfig("module.exports = { devServer: { server: 'http' } };");
+    expect(r.output).not.toContain('https');
+    expect(hasCode(r, 'devServer.https')).toBe(false);
+  });
+
+  it("maps server: 'https' to the cert guidance", () => {
+    const r = analyzeWebpackConfig("module.exports = { devServer: { server: 'https' } };");
+    expect(r.output).not.toContain('https: true');
+    expect(hasCode(r, 'devServer.https')).toBe(true);
+  });
+
+  it('copies server: { type, options } cert options through', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { devServer: { server: { type: 'https', options: { key: './k.pem' } } } };"
+    );
+    expect(r.output).toContain("key: './k.pem'");
+  });
+});
+
+describe('webpack 5 asset modules', () => {
+  it('reports asset/resource and asset as native (info)', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = { module: { rules: [
+        { test: /\\.png$/, type: 'asset/resource' },
+        { test: /\\.gif$/, type: 'asset' },
+      ] } };
+    `);
+    const ws = r.warnings.filter((w) => w.code === 'module.assetLoader');
+    expect(ws.length).toBe(2);
+    expect(ws.every((w) => w.type === 'info')).toBe(true);
+  });
+
+  it('flags asset/inline and asset/source import-shape changes (verify)', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = { module: { rules: [
+        { test: /\\.svg$/, type: 'asset/inline' },
+        { test: /\\.txt$/, type: 'asset/source' },
+      ] } };
+    `);
+    const ws = r.warnings.filter((w) => w.code === 'module.assetLoader');
+    expect(ws.length).toBe(2);
+    expect(ws.every((w) => w.type === 'verify')).toBe(true);
+    expect(ws.some((w) => w.message.includes("'?raw'"))).toBe(true);
+  });
+});
+
+describe('resolve.fallback', () => {
+  it('flags Node polyfill fallbacks and suggests vite-plugin-node-polyfills', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { resolve: { fallback: { crypto: 'crypto-browserify', buffer: 'buffer' } } };"
+    );
+    expect(r.warnings.find((w) => w.code === 'resolve.fallback')?.type).toBe('manual');
+    expect(r.flags.needsNodePolyfills).toBe(true);
+    expect(r.dependencies.some((d) => d.name === 'vite-plugin-node-polyfills')).toBe(true);
+  });
+});
+
+describe('framework loader/plugin pairs', () => {
+  it('classifies vue-loader and VueLoaderPlugin as replaced, not manual', () => {
+    const r = analyzeWebpackConfig(`
+      const { VueLoaderPlugin } = require('vue-loader');
+      module.exports = {
+        module: { rules: [{ test: /\\.vue$/, loader: 'vue-loader' }] },
+        plugins: [new VueLoaderPlugin()],
+      };
+    `);
+    expect(hasCode(r, 'module.customLoader')).toBe(false);
+    expect(hasCode(r, 'plugin.unknown')).toBe(false);
+    expect(r.warnings.some((w) => w.type === 'manual')).toBe(false);
+    expect(r.output).toContain('vue()');
+  });
+});
+
+describe('multi-config code', () => {
+  it('emits config.multiConfig for exported config arrays', () => {
+    const r = analyzeWebpackConfig('module.exports = [{ mode: "production" }, { mode: "development" }];');
+    expect(hasCode(r, 'config.multiConfig')).toBe(true);
+    expect(hasCode(r, 'config.functionForm')).toBe(false);
   });
 });
 

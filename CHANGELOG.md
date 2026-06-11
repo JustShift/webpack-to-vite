@@ -8,6 +8,18 @@
 
 ## Unreleased
 
+- Section values are no longer dropped silently. `plugins: [...].filter(Boolean)` and `[...].concat(cond ? [...] : [])` are unwrapped to the underlying array literal, conditional plugin elements (`cond && new X()`, ternaries) are classified on both branches, and any `plugins`/`output`/`resolve`/`module`/`devServer`/`optimization` value that cannot be read statically now emits a manual `config.dynamic` warning instead of nothing. Previously a config using these idioms converted to an empty skeleton rated "High confidence".
+- webpack 5 asset modules (`type: 'asset/resource'` etc.) are now recognized: `asset/resource` and `asset` report as natively handled (info), `asset/inline` and `asset/source` flag the `?inline`/`?raw` import-shape changes (verify). Previously these rules were invisible.
+- `resolve.fallback` now sets `needsNodePolyfills`, emits a manual `resolve.fallback` warning, and suggests `vite-plugin-node-polyfills`. Previously a Node-polyfill config converted to an empty skeleton with no warnings.
+- `output.library`/`libraryTarget` now emits a manual `output.library` warning pointing at `build.lib`. Previously library builds were dropped without a word.
+- Exact-match aliases containing `/` (e.g. `'@app/core$'`) no longer render a syntactically invalid regex literal; slashes are escaped in the generated `find` pattern.
+- `devServer.https`/`devServer.server` mapping rewritten: boolean `https: true` is no longer emitted (Vite's `server.https` takes `https.createServer()` options; `@vitejs/plugin-basic-ssl` is suggested instead, new `devServer.https` code), cert-option objects are copied through, and `server: 'http'` is dropped instead of being converted into an HTTPS dev server.
+- `output.path` keeps nested directories (`build/static`) instead of only the last segment; absolute paths fall back to the last segment with a verify warning.
+- Array entries now use the last element as the build input (webpack exports the last; earlier ones are usually polyfills). Previously the first element was used.
+- `vue-loader`/`VueLoaderPlugin` (and `svelte-loader`) are classified as replaced by the framework plugin the analyzer already wires in, instead of producing contradictory manual warnings on every standard Vue config.
+- Multi-config arrays now emit `config.multiConfig` instead of the mis-tagged `config.functionForm`.
+- CLI: absolute file paths work for the positional argument and `--out` (previously mangled by `join(cwd, ...)`).
+
 ## 0.1.0 — 2026-05-31
 
 - Vite 8-first Webpack → Vite migration analyzer with a parse → static-eval → intermediate-model → render pipeline. Static AST only, so your webpack config is never executed.
