@@ -1,6 +1,6 @@
 {
   "name": "@shiftkit/webpack-to-vite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Analyze a Webpack config and map it to a Vite config. AST-based, with actionable warnings.",
   "keywords": [
     "webpack",
