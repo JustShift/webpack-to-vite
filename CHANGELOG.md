@@ -20,7 +20,7 @@
 - Multi-config arrays now emit `config.multiConfig` instead of the mis-tagged `config.functionForm`.
 - CLI: absolute file paths work for the positional argument and `--out` (previously mangled by `join(cwd, ...)`).
 
-## 0.1.0 — 2026-05-31
+## 0.2.0 — 2026-06-11
 
 - Vite 8-first Webpack → Vite migration analyzer with a parse → static-eval → intermediate-model → render pipeline. Static AST only, so your webpack config is never executed.
   - **Vite 8 default output** (`build.rolldownOptions`, built-in `resolve.tsconfigPaths`); `targetViteMajor: 7` falls back to `build.rollupOptions` + the `vite-tsconfig-paths` plugin.
