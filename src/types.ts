@@ -91,6 +91,9 @@ export type WarningCode =
   | 'config.unmapped'
   | 'resolve.modules'
   | 'resolve.extensions'
+  | 'resolve.unmapped'
+  | 'output.unmapped'
+  | 'module.unmapped'
   | 'module.unknownRule'
   | 'plugin.unknown'
   | 'target.web';
@@ -145,6 +148,8 @@ export type ConversionResult = {
   warnings: Warning[];
   flags: ConversionFlags;
   dependencies: DependencySuggestion[];
+  /** Ready-to-paste index.html skeleton, present when HtmlWebpackPlugin was detected. */
+  indexHtml?: string;
 };
 
 export type AnalyzeOptions = {
@@ -190,11 +195,15 @@ export type ViteModel = {
   plugins: string[];
   /** Insertion-ordered define map keyed by the (already-quoted-if-needed) key. */
   define: Map<string, DefineEntry>;
+  /** Rendered `publicDir` value (from devServer.static/contentBase). */
+  publicDir?: string;
   resolve: {
     alias: AliasEntry[];
     extensions?: string[];
     tsconfigPaths?: boolean;
   };
+  /** css.preprocessorOptions: lang key ('scss'/'less'/'styl') → option name → rendered value. */
+  cssPreprocessorOptions: Map<string, Map<string, string>>;
   server: {
     host?: string;
     port?: string;
@@ -217,7 +226,18 @@ export type ViteModel = {
     base?: string;
     /** True when splitChunks was present and a codeSplitting stub should be emitted. */
     codeSplittingNote?: boolean;
+    /** Library build (from output.library/libraryTarget). Entry is taken from build.input. */
+    lib?: {
+      /** Rendered library name source, e.g. `'MyLib'`. */
+      name?: string;
+      /** Vite lib formats mapped from library.type/libraryTarget. */
+      formats?: string[];
+    };
   };
+  /** Raw entry path strings (un-rendered), used for the index.html skeleton. */
+  entryPaths: string[];
+  /** Statically-read HtmlWebpackPlugin options, used for the index.html skeleton. */
+  htmlPlugin?: { template?: string; title?: string; favicon?: string };
   /** Free-form `// MANUAL:`-style lines to drop into the build block. */
   buildNotes: string[];
   /** Whether the Vite 8 migration note block should be emitted. */
@@ -230,8 +250,10 @@ export function emptyModel(): ViteModel {
     plugins: [],
     define: new Map<string, DefineEntry>(),
     resolve: { alias: [] },
+    cssPreprocessorOptions: new Map<string, Map<string, string>>(),
     server: {},
     build: {},
+    entryPaths: [],
     buildNotes: [],
     vite8NoteNeeded: false,
   };

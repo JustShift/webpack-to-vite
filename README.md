@@ -26,8 +26,13 @@ webpack-to-vite webpack.config.js --json
 # fail CI when anything needs manual work
 webpack-to-vite webpack.config.js --strict
 
-# write vite.config.ts + shiftkit-webpack-to-vite-report.json (never touches package.json)
+# write vite.config.ts + shiftkit-webpack-to-vite-report.json
+# (+ an index.html skeleton when HtmlWebpackPlugin was detected and none exists)
 webpack-to-vite webpack.config.js --apply --out vite.config.ts
+
+# additionally add the REQUIRED dependencies from the checklist to
+# package.json devDependencies (opt-in; nothing is ever removed)
+webpack-to-vite webpack.config.js --apply --deps
 
 # target Vite 7 (rollupOptions + vite-tsconfig-paths) instead of the Vite 8 default
 webpack-to-vite webpack.config.js --target-vite 7
@@ -36,7 +41,7 @@ webpack-to-vite webpack.config.js --target-vite 7
 webpack-to-vite webpack.config.js --source "src/**/*.{js,jsx,ts,tsx}"
 ```
 
-See `--help` for all flags. `--apply` refuses to run on a dirty tree / outside a git repo unless `--force`, never deletes your webpack config, and never mutates `package.json`.
+See `--help` for all flags. `--apply` refuses to run on a dirty tree / outside a git repo unless `--force`, never deletes your webpack config, and never touches `package.json` unless you opt in with `--deps` (which only *adds* the required devDependencies — it never removes anything; the analyzer cannot know which webpack packages are still in use).
 
 ## Programmatic API
 
@@ -52,6 +57,7 @@ result.output;        // vite.config.ts skeleton (string)
 result.warnings;      // { type, code, message, path? }[]
 result.flags;         // detection flags (needsSvgr, hasModuleFederation, …)
 result.dependencies;  // { name, reason, required, caution? }[]
+result.indexHtml;     // ready-to-paste index.html skeleton (when HtmlWebpackPlugin was detected)
 getConfidence(result.warnings); // 'High confidence' | 'Verify before merging' | 'Manual review required'
 ```
 
@@ -75,17 +81,20 @@ Each warning carries a stable `code` (e.g. `resolve.aliasExact`, `plugin.federat
 | `tsconfig-paths` coupling | `resolve.tsconfigPaths: true` (Vite 8) / `vite-tsconfig-paths` (Vite 7) | verify |
 | `babel/ts/css/style/postcss` loaders | dropped (native) | info |
 | `file/url/raw` loaders | dropped; `?url` / `?raw` import suffixes | verify |
-| `sass/less/stylus` loaders | install the compiler | verify |
+| `sass/less/stylus` loaders | install the compiler; static loader options → `css.preprocessorOptions` | verify |
 | `@svgr/webpack` | `vite-plugin-svgr` (`?react`) | verify |
 | `worker-loader` | `?worker` import suffix | manual |
 | `DefinePlugin` | `define` (+ `process.env` shim → `import.meta.env`; `NODE_ENV` dropped) | verify / manual |
 | React / Vue / Svelte / Solid signal | matching `@vitejs/plugin-*` wired into `plugins` | verify |
-| `HtmlWebpackPlugin` | root `index.html` | verify |
+| `HtmlWebpackPlugin` | generated root `index.html` skeleton (entry/title/favicon read statically) | verify |
 | `Copy` / `MiniCssExtract` / `ProvidePlugin` / checkers / compression / analyzer | publicDir / native / plugins | info / verify / manual |
 | `ModuleFederationPlugin` | hard stop (architecture) | manual |
 | `devServer` (port/host/open/https/proxy + `pathRewrite`) | `server` | info / verify |
-| `entry` (string / object / array / fn) | `build.*Options.input` (HTML-first) | verify / manual |
+| `devServer.static` / `contentBase` (static values) | `publicDir` | verify |
+| `entry` (string / object / array / `path.resolve(...)` / fn) | `build.*Options.input` (HTML-first) | verify / manual |
 | `output` (path / publicPath / filename) | `outDir` / `base` / naming hints | info / verify |
+| `output.library` / `libraryTarget` | `build.lib` (`umd`→`umd`, `module`→`es`, `commonjs*`→`cjs`) | verify |
+| unrecognized keys inside `resolve` / `output` / `module` | named warning (nothing is dropped silently) | manual |
 | `devtool` | `build.sourcemap` | info / verify |
 | `optimization.splitChunks` | Rolldown `codeSplitting` stub | verify |
 | `externals`, non-web `target` | manual | manual |

@@ -87,6 +87,25 @@ export function handleResolve(ctx: AnalyzerContext, obj: t.ObjectExpression): vo
         'resolve.fallback',
         `resolve.fallback provides Node core-module polyfills for browser code. Vite has no equivalent; evaluate vite-plugin-node-polyfills (use sparingly), or remove the dependency on Node built-ins.`
       );
+    } else if (key === 'plugins') {
+      // tsconfig-paths-webpack-plugin is detected from the raw config text in the
+      // converter; anything else here is a resolver plugin we cannot map.
+      if (!/tsconfig-?paths/i.test(getSource(value))) {
+        ctx.manual(
+          'resolve.unmapped',
+          `resolve.plugins contains resolver plugins with no Vite config mapping. Find Vite equivalents or drop them manually.`
+        );
+      }
+    } else if (key === 'symlinks') {
+      ctx.verify(
+        'resolve.unmapped',
+        `resolve.symlinks maps inversely to Vite's resolve.preserveSymlinks (webpack symlinks: false ≈ Vite preserveSymlinks: true). Set it manually if you rely on it.`
+      );
+    } else {
+      ctx.manual(
+        'resolve.unmapped',
+        `resolve.${key} is not recognized by this analyzer and was dropped. Review it against Vite's resolve options manually.`
+      );
     }
   }
 
@@ -174,10 +193,30 @@ interface LoaderUse {
 }
 
 export function handleModule(ctx: AnalyzerContext, obj: t.ObjectExpression): void {
+  for (const p of obj.properties) {
+    if (!t.isObjectProperty(p) || p.computed) {
+      ctx.manual('module.unmapped', `A dynamic 'module' section entry could not be analyzed. Review it manually.`);
+      continue;
+    }
+    const key = propName(p);
+    if (!key) continue;
+    if (key === 'rules') continue; // handled below
+    if (key === 'strictExportPresence' || key === 'unsafeCache') {
+      ctx.info('module.unmapped', `module.${key} has no Vite equivalent and is typically unnecessary. Dropped.`);
+      continue;
+    }
+    ctx.manual(
+      'module.unmapped',
+      `module.${key} is not recognized by this analyzer and was dropped (e.g. noParse/parser/generator have no direct Vite mapping). Review it manually.`
+    );
+  }
+
   const rulesProp = obj.properties.find(
     (p) => t.isObjectProperty(p) && !p.computed && propName(p) === 'rules'
   );
-  if (!rulesProp || !t.isObjectProperty(rulesProp) || !t.isArrayExpression(rulesProp.value)) {
+  if (!rulesProp || !t.isObjectProperty(rulesProp)) return;
+  if (!t.isArrayExpression(rulesProp.value)) {
+    ctx.manual('module.unmapped', `module.rules is not a static array and could not be analyzed. Review the loader rules manually.`);
     return;
   }
   for (const rule of rulesProp.value.elements) {
@@ -327,10 +366,18 @@ function classifyLoader(ctx: AnalyzerContext, use: LoaderUse): void {
     if (preprocessor === 'sass') ctx.flags.needsSass = true;
     if (preprocessor === 'less') ctx.flags.needsLess = true;
     if (preprocessor === 'stylus') ctx.flags.needsStylus = true;
-    ctx.verify(
-      'module.preprocessor',
-      `${name} maps to Vite's built-in ${preprocessor} support. Install the '${preprocessor}' compiler package; no loader config is needed. Verify any loader options (additionalData, includePaths) are moved to css.preprocessorOptions.`
-    );
+    const mappedOptions = applyPreprocessorOptions(ctx, preprocessor, use.options);
+    if (mappedOptions) {
+      ctx.verify(
+        'module.preprocessor',
+        `${name} maps to Vite's built-in ${preprocessor} support. Install the '${preprocessor}' compiler package; the loader options were moved to css.preprocessorOptions.${CSS_LANG_KEYS[preprocessor]} — verify each one against the ${preprocessor} compiler options.`
+      );
+    } else {
+      ctx.verify(
+        'module.preprocessor',
+        `${name} maps to Vite's built-in ${preprocessor} support. Install the '${preprocessor}' compiler package; no loader config is needed. Verify any loader options (additionalData, includePaths) are moved to css.preprocessorOptions.`
+      );
+    }
     return;
   }
 
@@ -365,6 +412,74 @@ function classifyLoader(ctx: AnalyzerContext, use: LoaderUse): void {
     'module.customLoader',
     `Loader '${name}' has no known Vite equivalent. Find a matching Vite plugin or rework the transform; it cannot be mapped from config alone.`
   );
+}
+
+// Vite css.preprocessorOptions key per preprocessor.
+const CSS_LANG_KEYS: Record<'sass' | 'less' | 'stylus', string> = {
+  sass: 'scss',
+  less: 'less',
+  stylus: 'styl',
+};
+
+// Loader options Vite/the preprocessor handle internally; dropping them is safe.
+const PREPROCESSOR_DROP_OPTIONS = new Set(['implementation', 'sourceMap', 'webpackImporter', 'esModule', 'api']);
+
+/**
+ * Move statically-readable preprocessor loader options (additionalData,
+ * includePaths, …) into css.preprocessorOptions.<lang>. Nested sassOptions/
+ * lessOptions/stylusOptions objects are flattened: Vite passes the lang block
+ * straight to the compiler. Returns true when at least one option was emitted.
+ */
+function applyPreprocessorOptions(
+  ctx: AnalyzerContext,
+  preprocessor: 'sass' | 'less' | 'stylus',
+  options?: t.ObjectExpression
+): boolean {
+  if (!options) return false;
+  const langKey = CSS_LANG_KEYS[preprocessor];
+  const target = ctx.model.cssPreprocessorOptions.get(langKey) ?? new Map<string, string>();
+  let emitted = 0;
+
+  const addOption = (key: string, valueNode: t.Node) => {
+    target.set(quoteKey(key), getSource(valueNode));
+    emitted++;
+  };
+
+  for (const p of options.properties) {
+    if (!t.isObjectProperty(p) || p.computed) {
+      ctx.verify(
+        'module.preprocessor',
+        `A dynamic ${preprocessor}-loader option could not be read statically. Move it into css.preprocessorOptions.${langKey} manually.`
+      );
+      continue;
+    }
+    const key = propName(p);
+    if (!key) continue;
+    if (PREPROCESSOR_DROP_OPTIONS.has(key)) continue;
+    const value = p.value as t.Node;
+
+    // webpack's older name for additionalData.
+    if (key === 'prependData') {
+      addOption('additionalData', value);
+      continue;
+    }
+    // Compiler-option wrappers: flatten into the lang block.
+    if ((key === 'sassOptions' || key === 'lessOptions' || key === 'stylusOptions') && t.isObjectExpression(value)) {
+      for (const sub of value.properties) {
+        if (!t.isObjectProperty(sub) || sub.computed) continue;
+        const subKey = propName(sub);
+        if (subKey) addOption(subKey, sub.value as t.Node);
+      }
+      continue;
+    }
+    addOption(key, value);
+  }
+
+  if (emitted > 0) {
+    ctx.model.cssPreprocessorOptions.set(langKey, target);
+    return true;
+  }
+  return false;
 }
 
 function detectCssModules(ctx: AnalyzerContext, options?: t.ObjectExpression): void {
@@ -459,9 +574,10 @@ function classifyPlugin(ctx: AnalyzerContext, name: string, args: t.Node[]): voi
       return;
     case 'HtmlWebpackPlugin':
       ctx.flags.hasHtmlPlugin = true;
+      captureHtmlPluginOptions(ctx, args[0]);
       ctx.verify(
         'plugin.html',
-        `HtmlWebpackPlugin → Vite is HTML-first. Create an index.html at the project root with <script type="module" src="/src/entry.tsx"></script>. Move template variables/<%= %> interpolation to Vite's HTML env replacement or a plugin. Verify favicon/meta injection.`
+        `HtmlWebpackPlugin → Vite is HTML-first. A ready-to-paste index.html skeleton was generated from the plugin options (indexHtml in the result; --apply writes it next to the config). Move template variables/<%= %> interpolation to Vite's HTML env replacement or a plugin. Verify favicon/meta injection.`
       );
       return;
     case 'MiniCssExtractPlugin':
@@ -531,6 +647,23 @@ function classifyPlugin(ctx: AnalyzerContext, name: string, args: t.Node[]): voi
         `Plugin '${name}' was not classified. Check whether an equivalent Vite plugin exists or whether Vite handles it natively; it cannot be mapped from config alone.`
       );
   }
+}
+
+// Statically read the HtmlWebpackPlugin options the index.html skeleton uses.
+// First plugin instance wins (multi-page setups need one HTML file per entry).
+function captureHtmlPluginOptions(ctx: AnalyzerContext, arg: t.Node | undefined): void {
+  if (ctx.model.htmlPlugin) return;
+  const captured: { template?: string; title?: string; favicon?: string } = {};
+  if (arg && t.isObjectExpression(arg)) {
+    for (const p of arg.properties) {
+      if (!t.isObjectProperty(p) || p.computed) continue;
+      const key = propName(p);
+      if (key !== 'template' && key !== 'title' && key !== 'favicon') continue;
+      const value = evalString(p.value as t.Node);
+      if (value != null) captured[key] = value;
+    }
+  }
+  ctx.model.htmlPlugin = captured;
 }
 
 export function handleDefinePlugin(ctx: AnalyzerContext, arg: t.Node | undefined): void {
@@ -696,12 +829,22 @@ export function handleDevServer(ctx: AnalyzerContext, obj: t.ObjectExpression): 
         ctx.info('devServer.basic', `devServer.${key} is unnecessary: Vite has HMR enabled by default.`);
         break;
       case 'static':
-      case 'contentBase':
-        ctx.info(
-          'devServer.basic',
-          `devServer.${key} maps loosely to Vite's publicDir (files served as-is from root). Verify the directory.`
-        );
+      case 'contentBase': {
+        const dir = staticDirValue(value);
+        if (dir != null) {
+          ctx.model.publicDir = quoteString(dir);
+          ctx.verify(
+            'devServer.basic',
+            `devServer.${key} was mapped to Vite's publicDir ('${dir}'). Files there are served as-is at '/' and copied into the build output; verify the directory.`
+          );
+        } else {
+          ctx.info(
+            'devServer.basic',
+            `devServer.${key} maps loosely to Vite's publicDir (files served as-is from root), but the value could not be read statically. Set publicDir manually.`
+          );
+        }
         break;
+      }
       default:
         ctx.info(
           'devServer.basic',
@@ -712,6 +855,24 @@ export function handleDevServer(ctx: AnalyzerContext, obj: t.ObjectExpression): 
   if (mappedBasic) {
     ctx.info('devServer.basic', `Basic devServer options (port/host/open/https) were mapped to Vite 'server'.`);
   }
+}
+
+// Resolve devServer.static/contentBase to a directory string: a plain string,
+// a `{ directory }` object, or a single-element array of either. Boolean and
+// multi-entry values yield null (fall back to the loose-mapping note).
+function staticDirValue(value: t.Node): string | null {
+  if (t.isArrayExpression(value) && value.elements.length === 1 && value.elements[0]) {
+    return staticDirValue(value.elements[0]);
+  }
+  if (t.isObjectExpression(value)) {
+    const dirProp = value.properties.find(
+      (p) => t.isObjectProperty(p) && !p.computed && propName(p) === 'directory'
+    );
+    if (dirProp && t.isObjectProperty(dirProp)) return evalString(dirProp.value as t.Node);
+    return null;
+  }
+  if (t.isBooleanLiteral(value)) return null;
+  return evalString(value);
 }
 
 // Vite's server.https takes https.createServer() options, not a boolean: a
@@ -837,8 +998,12 @@ function regexFromRewriteKey(key: string): string {
 // ---------------------------------------------------------------------------
 
 export function handleEntry(ctx: AnalyzerContext, value: t.Node): void {
-  if (t.isStringLiteral(value)) {
-    ctx.model.build.input = quoteString(value.value);
+  // Static-eval first: covers './src/index.js' and path.resolve(__dirname, 'src/index.js')
+  // alike (the latter resolves to its root-relative tail).
+  const single = !t.isArrayExpression(value) && !t.isObjectExpression(value) ? entryString(value) : null;
+  if (single != null) {
+    ctx.model.build.input = quoteString(single);
+    ctx.model.entryPaths.push(single);
     ctx.verify(
       'entry.mapped',
       `entry was mapped into Vite build input, but Vite's normal application entry is HTML-first: an index.html with <script type="module">. Verify index.html and its script tags rather than relying on build input alone.`
@@ -854,7 +1019,10 @@ export function handleEntry(ctx: AnalyzerContext, value: t.Node): void {
       const name = propName(p);
       if (name == null) continue;
       const target = entryTarget(p.value as t.Node);
-      if (target) entries.push(`${quoteKey(name)}: ${target}`);
+      if (target != null) {
+        entries.push(`${quoteKey(name)}: ${quoteString(target)}`);
+        ctx.model.entryPaths.push(target);
+      }
     }
     if (entries.length > 0) {
       ctx.model.build.input = `{ ${entries.join(', ')} }`;
@@ -869,9 +1037,14 @@ export function handleEntry(ctx: AnalyzerContext, value: t.Node): void {
   if (t.isArrayExpression(value)) {
     // Webpack bundles all array elements but exports the LAST one; earlier
     // entries are usually polyfills.
-    const strings = value.elements.filter((e): e is t.StringLiteral => e != null && t.isStringLiteral(e));
+    const strings = value.elements
+      .map((e) => (e && !t.isSpreadElement(e) ? entryString(e) : null))
+      .filter((s): s is string => s != null);
     const last = strings[strings.length - 1];
-    if (last) ctx.model.build.input = quoteString(last.value);
+    if (last != null) {
+      ctx.model.build.input = quoteString(last);
+      ctx.model.entryPaths.push(last);
+    }
     ctx.verify(
       'entry.dynamic',
       `entry is an array (multiple files bundled into one; webpack exports the last). The last entry was used as a placeholder; import the earlier files (often polyfills) from it.`
@@ -885,13 +1058,22 @@ export function handleEntry(ctx: AnalyzerContext, value: t.Node): void {
   );
 }
 
+// Resolve an entry value to a path string. path.resolve(__dirname, 'src/x.js')
+// statically evals to 'src/x.js'; re-anchor it as './src/x.js'.
+function entryString(node: t.Node): string | null {
+  const s = t.isStringLiteral(node) ? node.value : evalString(node);
+  if (s == null || s === '') return null;
+  if (s.startsWith('.') || s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
+  return `./${s}`;
+}
+
 function entryTarget(node: t.Node): string | null {
-  if (t.isStringLiteral(node)) return quoteString(node.value);
   if (t.isArrayExpression(node)) {
     // Same array semantics as the top-level entry: webpack exports the last.
-    const strings = node.elements.filter((e): e is t.StringLiteral => e != null && t.isStringLiteral(e));
-    const last = strings[strings.length - 1];
-    if (last) return quoteString(last.value);
+    const strings = node.elements
+      .map((e) => (e && !t.isSpreadElement(e) ? entryString(e) : null))
+      .filter((s): s is string => s != null);
+    return strings[strings.length - 1] ?? null;
   }
   if (t.isObjectExpression(node)) {
     // { import: './x', dependOn: '...' }
@@ -899,8 +1081,9 @@ function entryTarget(node: t.Node): string | null {
       (p) => t.isObjectProperty(p) && !p.computed && propName(p) === 'import'
     );
     if (imp && t.isObjectProperty(imp)) return entryTarget(imp.value as t.Node);
+    return null;
   }
-  return null;
+  return entryString(node);
 }
 
 // ---------------------------------------------------------------------------
@@ -984,16 +1167,88 @@ export function handleOutput(ctx: AnalyzerContext, obj: t.ObjectExpression): voi
         break;
       case 'library':
       case 'libraryTarget':
-        ctx.manual(
-          'output.library',
-          `output.${key} was detected: this is a library build. Vite handles libraries via build.lib ({ entry, name, formats, fileName }); map library.type/libraryTarget to formats ('umd', 'es', 'cjs', 'iife'). The analyzer does not emit build.lib automatically yet.`
-        );
+        handleLibrary(ctx, key, value);
         break;
-      // globalObject / assetModuleFilename etc. are out of v0.1 scope.
+      case 'globalObject':
+      case 'pathinfo':
+      case 'hashDigestLength':
+      case 'hashFunction':
+      case 'compareBeforeEmit':
+        ctx.info('output.unmapped', `output.${key} has no Vite equivalent and is typically unnecessary. Dropped.`);
+        break;
       default:
+        ctx.manual(
+          'output.unmapped',
+          `output.${key} is not recognized by this analyzer and was dropped (e.g. assetModuleFilename maps loosely to build.assetsDir / rolldown asset naming). Review it manually.`
+        );
         break;
     }
   }
+}
+
+// webpack library.type / libraryTarget → Vite build.lib formats.
+const LIBRARY_TYPE_FORMATS: Record<string, string> = {
+  umd: 'umd',
+  umd2: 'umd',
+  module: 'es',
+  commonjs: 'cjs',
+  'commonjs2': 'cjs',
+  'commonjs-module': 'cjs',
+  var: 'iife',
+  window: 'iife',
+  self: 'iife',
+  global: 'iife',
+  this: 'iife',
+  assign: 'iife',
+};
+
+/**
+ * Build the build.lib block from output.library / output.libraryTarget. The
+ * entry comes from the detected webpack entry (render.ts moves build.input into
+ * lib.entry). Unknown library types fall back to the manual warning.
+ */
+function handleLibrary(ctx: AnalyzerContext, key: string, value: t.Node): void {
+  const lib = ctx.model.build.lib ?? {};
+
+  let name: string | null = null;
+  let type: string | null = null;
+
+  if (key === 'libraryTarget') {
+    type = evalString(value);
+  } else if (t.isStringLiteral(value)) {
+    name = value.value;
+  } else if (t.isObjectExpression(value)) {
+    for (const p of value.properties) {
+      if (!t.isObjectProperty(p) || p.computed) continue;
+      const k = propName(p);
+      if (k === 'name') name = evalString(p.value as t.Node);
+      if (k === 'type') type = evalString(p.value as t.Node);
+    }
+  }
+
+  if (name != null) lib.name = quoteString(name);
+  if (type != null) {
+    const format = LIBRARY_TYPE_FORMATS[type];
+    if (format) {
+      if (!lib.formats) lib.formats = [];
+      if (!lib.formats.includes(format)) lib.formats.push(format);
+    } else {
+      ctx.manual(
+        'output.library',
+        `output library type '${type}' has no Vite build.lib format ('es', 'cjs', 'umd', 'iife'). Map it manually.`
+      );
+    }
+  }
+
+  ctx.model.build.lib = lib;
+  ctx.verify(
+    'output.library',
+    `output.${key} was mapped to a build.lib block (entry from the detected webpack entry${
+      name != null ? `, name '${name}'` : ''
+    }${
+      lib.formats ? `, formats [${lib.formats.join(', ')}]` : ''
+    }). Verify the entry, formats, and fileName; 'umd' and 'iife' builds need build.lib.name set.`
+  );
 }
 
 // ---------------------------------------------------------------------------

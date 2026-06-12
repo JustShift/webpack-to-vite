@@ -14,7 +14,7 @@
 import * as t from '@babel/types';
 import { parseWebpackConfig } from './parser.js';
 import { propName } from './static-eval.js';
-import { render } from './render.js';
+import { buildIndexHtml, render } from './render.js';
 import { buildDependencies } from './dependencies.js';
 import {
   handleDevServer,
@@ -180,12 +180,16 @@ export function analyzeWebpackConfig(input: string, options?: AnalyzeOptions): C
   }
 
   const output = render(ctx.model, resolved.targetViteMajor);
-  return {
+  const result: ConversionResult = {
     output,
     warnings,
     flags: ctx.flags,
     dependencies: mergeDependencies(buildDependencies(ctx.flags), ctx.extraDependencies),
   };
+  if (ctx.flags.hasHtmlPlugin) {
+    result.indexHtml = buildIndexHtml(ctx.model);
+  }
+  return result;
 }
 
 function mergeDependencies(

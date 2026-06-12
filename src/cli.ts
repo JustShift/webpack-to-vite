@@ -26,13 +26,18 @@ Options:
       --source <glob>     Also scan source files for migration traps (advanced)
       --apply             Write the Vite config + a JSON report to disk
       --out <file>        With --apply, the config path (default vite.config.ts)
+      --deps              With --apply, add the REQUIRED dependencies from the
+                          checklist to package.json devDependencies (opt-in;
+                          nothing is ever removed)
       --force             With --apply, bypass dirty-tree / overwrite / repo checks
   -q, --quiet             Suppress the report on stderr
   -h, --help              Show this help
 
 Default (no --apply): writes the Vite config skeleton to stdout; the migration
-report goes to stderr. --apply also writes shiftkit-webpack-to-vite-report.json.
-It never deletes your webpack config and never mutates package.json.
+report goes to stderr. --apply also writes shiftkit-webpack-to-vite-report.json
+and, when HtmlWebpackPlugin was detected, an index.html skeleton (only if none
+exists). It never deletes your webpack config and never touches package.json
+unless you opt in with --deps.
 `);
 };
 
@@ -41,6 +46,7 @@ interface ParsedArgs {
   quiet: boolean;
   json: boolean;
   apply: boolean;
+  deps: boolean;
   force: boolean;
   out: string;
   targetVite: 7 | 8;
@@ -54,6 +60,7 @@ const parseArgs = (): ParsedArgs => {
     quiet: false,
     json: false,
     apply: false,
+    deps: false,
     force: false,
     out: 'vite.config.ts',
     targetVite: 8,
@@ -69,6 +76,7 @@ const parseArgs = (): ParsedArgs => {
     else if (a === '-q' || a === '--quiet') p.quiet = true;
     else if (a === '--json') p.json = true;
     else if (a === '--apply' || a === '--write') p.apply = true;
+    else if (a === '--deps') p.deps = true;
     else if (a === '--force') p.force = true;
     else if (a === '--out') p.out = args[++i] ?? p.out;
     else if (a === '--source') p.sources.push(args[++i] ?? '');
@@ -208,6 +216,52 @@ const collectSources = (globs: string[], cwd: string): Array<{ path: string; con
   return [...files.entries()].map(([path, content]) => ({ path: relative(cwd, path).split('\\').join('/'), content }));
 };
 
+// ---- --deps: opt-in package.json devDependencies update ----
+
+// Default version ranges for newly-added devDependencies. Reviewed 2026-06;
+// bump these when the Vite ecosystem ships new majors (see RELEASING.md).
+const DEP_VERSION_RANGES: Record<string, string> = {
+  vite: '^8.0.0',
+  'vite-plugin-svgr': '^5.0.0',
+  sass: '^1.80.0',
+  less: '^4.2.0',
+  stylus: '^0.64.0',
+  'vite-tsconfig-paths': '^6.0.0',
+  'vite-plugin-static-copy': '^3.0.0',
+  'vite-plugin-checker': '^0.11.0',
+  'rollup-plugin-visualizer': '^6.0.0',
+  'vite-plugin-compression2': '^2.0.0',
+  'vite-plugin-node-polyfills': '^0.24.0',
+  '@vitejs/plugin-react': '^5.0.0',
+  '@vitejs/plugin-vue': '^6.0.0',
+  '@sveltejs/vite-plugin-svelte': '^6.0.0',
+  'vite-plugin-solid': '^2.11.0',
+  '@vitejs/plugin-basic-ssl': '^2.0.0',
+};
+
+// Adds the *required* checklist dependencies to devDependencies. Deliberately
+// additive-only: the analyzer cannot know which webpack packages are still
+// needed (multi-config repos, scripts), so it never removes anything.
+const addRequiredDeps = (pkgPath: string, result: ConversionResult, targetVite: 7 | 8): string[] => {
+  const raw = readFileSync(pkgPath, 'utf8');
+  const pkg = JSON.parse(raw);
+  pkg.devDependencies = pkg.devDependencies ?? {};
+  const added: string[] = [];
+  for (const dep of result.dependencies) {
+    if (!dep.required) continue;
+    if (pkg.dependencies?.[dep.name] || pkg.devDependencies[dep.name]) continue;
+    let range = DEP_VERSION_RANGES[dep.name] ?? 'latest';
+    if (dep.name === 'vite' && targetVite === 7) range = '^7.0.0';
+    pkg.devDependencies[dep.name] = range;
+    added.push(dep.name);
+  }
+  if (added.length > 0) {
+    const trailingNewline = raw.endsWith('\n') ? '\n' : '';
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + trailingNewline);
+  }
+  return added;
+};
+
 // ---- output ----
 
 const printReport = (result: ConversionResult, quiet: boolean): void => {
@@ -268,11 +322,49 @@ const main = async () => {
     const reportPath = join(cwd, 'shiftkit-webpack-to-vite-report.json');
     writeFileSync(reportPath, JSON.stringify(result, null, 2) + '\n');
 
+    let wroteIndexHtml: string | null = null;
+    let skippedIndexHtml = false;
+    if (result.indexHtml) {
+      const indexPath = join(cwd, 'index.html');
+      if (existsSync(indexPath)) {
+        skippedIndexHtml = true;
+      } else {
+        writeFileSync(indexPath, result.indexHtml);
+        wroteIndexHtml = indexPath;
+      }
+    }
+
+    let depsAdded: string[] = [];
+    if (parsed.deps) {
+      const pkgPath = join(cwd, 'package.json');
+      if (existsSync(pkgPath)) {
+        depsAdded = addRequiredDeps(pkgPath, result, parsed.targetVite);
+      } else {
+        process.stderr.write(`--deps: no package.json found in ${cwd}; skipped.\n`);
+      }
+    }
+
     if (parsed.json) {
-      process.stdout.write(JSON.stringify({ wrote: target, report: reportPath, ...result }, null, 2) + '\n');
+      process.stdout.write(
+        JSON.stringify(
+          { wrote: target, report: reportPath, indexHtml: wroteIndexHtml, depsAdded, ...result },
+          null,
+          2
+        ) + '\n'
+      );
     } else {
       process.stdout.write(`✓ Wrote ${parsed.out} (a skeleton — review the report).\n`);
       process.stdout.write(`✓ Wrote shiftkit-webpack-to-vite-report.json\n`);
+      if (wroteIndexHtml) {
+        process.stdout.write(`✓ Wrote index.html (skeleton from HtmlWebpackPlugin — merge your template markup).\n`);
+      } else if (skippedIndexHtml) {
+        process.stdout.write(`• index.html already exists; the generated skeleton is in the JSON report (indexHtml).\n`);
+      }
+      if (depsAdded.length > 0) {
+        process.stdout.write(`✓ Added to package.json devDependencies: ${depsAdded.join(', ')}\n`);
+      } else if (parsed.deps) {
+        process.stdout.write(`• --deps: all required dependencies are already present.\n`);
+      }
       printReport(result, parsed.quiet);
     }
     return;

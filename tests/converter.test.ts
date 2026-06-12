@@ -374,13 +374,41 @@ describe('entry / output edge cases', () => {
     expect(r.warnings.find((w) => w.code === 'output.outDir')?.type).toBe('verify');
   });
 
-  it('flags output.library as a manual build.lib migration', () => {
+  it('emits build.lib for output.library object form', () => {
     const r = analyzeWebpackConfig(
-      "module.exports = { output: { library: { name: 'MyLib', type: 'umd' } } };"
+      "module.exports = { entry: './src/index.ts', output: { library: { name: 'MyLib', type: 'umd' } } };"
     );
     const w = r.warnings.find((x) => x.code === 'output.library');
+    expect(w?.type).toBe('verify');
+    expect(r.output).toContain('lib: {');
+    expect(r.output).toContain("entry: './src/index.ts'");
+    expect(r.output).toContain("name: 'MyLib'");
+    expect(r.output).toContain("formats: ['umd']");
+    // The entry moved into build.lib; no separate bundler input.
+    expect(r.output).not.toContain('input:');
+  });
+
+  it('maps libraryTarget string forms to build.lib formats', () => {
+    const cjs = analyzeWebpackConfig("module.exports = { output: { libraryTarget: 'commonjs2' } };");
+    expect(cjs.output).toContain("formats: ['cjs']");
+    const esm = analyzeWebpackConfig("module.exports = { output: { library: { type: 'module' } } };");
+    expect(esm.output).toContain("formats: ['es']");
+    expect(esm.output).toContain('// TODO: no static webpack entry was detected');
+  });
+
+  it('falls back to manual for an unknown library type', () => {
+    const r = analyzeWebpackConfig("module.exports = { output: { libraryTarget: 'amd' } };");
+    const w = r.warnings.find((x) => x.code === 'output.library' && x.type === 'manual');
+    expect(w?.message).toContain("'amd'");
+  });
+
+  it('warns on unrecognized output keys instead of dropping them silently', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { output: { assetModuleFilename: 'assets/[hash][ext]' } };"
+    );
+    const w = r.warnings.find((x) => x.code === 'output.unmapped');
     expect(w?.type).toBe('manual');
-    expect(w?.message).toContain('build.lib');
+    expect(w?.message).toContain('assetModuleFilename');
   });
 
   it('escapes slashes in exact-match alias regexes', () => {
@@ -451,6 +479,155 @@ describe('webpack 5 asset modules', () => {
     expect(ws.length).toBe(2);
     expect(ws.every((w) => w.type === 'verify')).toBe(true);
     expect(ws.some((w) => w.message.includes("'?raw'"))).toBe(true);
+  });
+});
+
+describe('nested unmapped keys (silent-drop guard)', () => {
+  it('warns on unrecognized resolve keys', () => {
+    const r = analyzeWebpackConfig("module.exports = { resolve: { mainFields: ['browser', 'module'] } };");
+    const w = r.warnings.find((x) => x.code === 'resolve.unmapped');
+    expect(w?.type).toBe('manual');
+    expect(w?.message).toContain('mainFields');
+  });
+
+  it('points resolve.symlinks at preserveSymlinks (verify)', () => {
+    const r = analyzeWebpackConfig('module.exports = { resolve: { symlinks: false } };');
+    const w = r.warnings.find((x) => x.code === 'resolve.unmapped');
+    expect(w?.type).toBe('verify');
+    expect(w?.message).toContain('preserveSymlinks');
+  });
+
+  it('does not flag resolve.plugins when it is the tsconfig-paths plugin', () => {
+    const r = analyzeWebpackConfig(`
+      const TsconfigPathsPlugin = require('tsconfig-paths-webpack-plugin');
+      module.exports = { resolve: { plugins: [new TsconfigPathsPlugin()] } };
+    `);
+    expect(r.warnings.some((w) => w.code === 'resolve.unmapped')).toBe(false);
+  });
+
+  it('warns on unrecognized module keys like noParse', () => {
+    const r = analyzeWebpackConfig('module.exports = { module: { noParse: /jquery/, rules: [] } };');
+    const w = r.warnings.find((x) => x.code === 'module.unmapped');
+    expect(w?.type).toBe('manual');
+    expect(w?.message).toContain('noParse');
+  });
+
+  it('warns when module.rules itself is dynamic', () => {
+    const r = analyzeWebpackConfig('module.exports = { module: { rules: getRules() } };');
+    const w = r.warnings.find((x) => x.code === 'module.unmapped');
+    expect(w?.type).toBe('manual');
+    expect(w?.message).toContain('module.rules');
+  });
+});
+
+describe('css.preprocessorOptions emission', () => {
+  it('moves sass-loader additionalData and sassOptions into css.preprocessorOptions.scss', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = { module: { rules: [{
+        test: /\\.scss$/,
+        use: ['style-loader', 'css-loader', {
+          loader: 'sass-loader',
+          options: {
+            additionalData: '@use "sass:math";',
+            implementation: require('sass'),
+            sassOptions: { includePaths: ['./src/styles'] },
+          },
+        }],
+      }] } };
+    `);
+    expect(r.output).toContain('css: {');
+    expect(r.output).toContain('preprocessorOptions: {');
+    expect(r.output).toContain('scss: {');
+    expect(r.output).toContain(`additionalData: '@use "sass:math";'`);
+    expect(r.output).toContain("includePaths: ['./src/styles']");
+    // implementation is handled by Vite itself.
+    expect(r.output).not.toContain('implementation');
+    const w = r.warnings.find((x) => x.code === 'module.preprocessor');
+    expect(w?.message).toContain('css.preprocessorOptions.scss');
+  });
+
+  it('emits no css block for option-less preprocessor loaders', () => {
+    const r = analyzeWebpackConfig(
+      "module.exports = { module: { rules: [{ test: /\\.less$/, use: ['less-loader'] }] } };"
+    );
+    expect(r.output).not.toContain('css: {');
+  });
+});
+
+describe('entry static-eval', () => {
+  it('resolves path.resolve(__dirname, ...) entries instead of falling to manual', () => {
+    const r = analyzeWebpackConfig(`
+      const path = require('path');
+      module.exports = { entry: path.resolve(__dirname, 'src/index.js') };
+    `);
+    expect(hasCode(r, 'entry.mapped')).toBe(true);
+    expect(r.warnings.some((w) => w.code === 'entry.dynamic' && w.type === 'manual')).toBe(false);
+    expect(r.output).toContain("input: './src/index.js'");
+  });
+
+  it('resolves path.resolve values inside object-form entries', () => {
+    const r = analyzeWebpackConfig(`
+      const path = require('path');
+      module.exports = { entry: { main: path.resolve(__dirname, 'src/main.ts'), admin: './src/admin.ts' } };
+    `);
+    expect(r.output).toContain("main: './src/main.ts'");
+    expect(r.output).toContain("admin: './src/admin.ts'");
+  });
+});
+
+describe('devServer.static → publicDir', () => {
+  it('maps a static string to publicDir', () => {
+    const r = analyzeWebpackConfig("module.exports = { devServer: { static: './public' } };");
+    expect(r.output).toContain("publicDir: './public'");
+  });
+
+  it('maps a { directory } object (incl. path.resolve) to publicDir', () => {
+    const r = analyzeWebpackConfig(`
+      const path = require('path');
+      module.exports = { devServer: { static: { directory: path.resolve(__dirname, 'public') } } };
+    `);
+    expect(r.output).toContain("publicDir: 'public'");
+  });
+
+  it('maps webpack 4 contentBase to publicDir', () => {
+    const r = analyzeWebpackConfig("module.exports = { devServer: { contentBase: './assets' } };");
+    expect(r.output).toContain("publicDir: './assets'");
+  });
+
+  it('falls back to the loose-mapping note for boolean/dynamic values', () => {
+    const r = analyzeWebpackConfig('module.exports = { devServer: { static: true } };');
+    expect(r.output).not.toContain('publicDir:');
+    expect(r.warnings.some((w) => w.code === 'devServer.basic' && w.message.includes('publicDir'))).toBe(true);
+  });
+});
+
+describe('index.html skeleton', () => {
+  it('generates an index.html with the detected entry and title', () => {
+    const r = analyzeWebpackConfig(`
+      const HtmlWebpackPlugin = require('html-webpack-plugin');
+      module.exports = {
+        entry: './src/index.tsx',
+        plugins: [new HtmlWebpackPlugin({ template: './public/index.html', title: 'My App', favicon: './public/favicon.ico' })],
+      };
+    `);
+    expect(r.indexHtml).toBeDefined();
+    expect(r.indexHtml).toContain('<script type="module" src="/src/index.tsx"></script>');
+    expect(r.indexHtml).toContain('<title>My App</title>');
+    expect(r.indexHtml).toContain('<link rel="icon" href="/public/favicon.ico" />');
+    expect(r.indexHtml).toContain('template: ./public/index.html');
+  });
+
+  it('emits a TODO placeholder when no static entry was detected', () => {
+    const r = analyzeWebpackConfig(`
+      module.exports = { entry: getEntry(), plugins: [new HtmlWebpackPlugin()] };
+    `);
+    expect(r.indexHtml).toContain('TODO: no static webpack entry was detected');
+    expect(r.indexHtml).toContain('src="/src/main.js"');
+  });
+
+  it('does not generate index.html without HtmlWebpackPlugin', () => {
+    const r = analyzeWebpackConfig("module.exports = { entry: './src/index.js' };");
+    expect(r.indexHtml).toBeUndefined();
   });
 });
 
