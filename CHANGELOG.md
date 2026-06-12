@@ -6,7 +6,7 @@
   the release workflow extracts that exact section for the GitHub Release notes.
 -->
 
-## Unreleased
+## 0.3.0 — 2026-06-13
 
 - `output.library`/`libraryTarget` — previously dropped without a word — now emits a real `build.lib` block (entry from the detected webpack entry, `name`, and `formats` mapped from `umd`→`umd`, `module`→`es`, `commonjs*`→`cjs`, `var`/`window`/…→`iife`) with a verify warning. Unknown library types fall back to a manual warning.
 - Unknown keys inside `resolve`, `output`, and `module` (e.g. `resolve.mainFields`, `output.assetModuleFilename`, `module.noParse`) now emit named `resolve.unmapped`/`output.unmapped`/`module.unmapped` warnings instead of being dropped in silence — the systemic fix for the audit's silent-drop bug class. `resolve.symlinks` points at Vite's inverse `preserveSymlinks`; benign keys (`output.pathinfo`, `module.strictExportPresence`, …) report as info.
